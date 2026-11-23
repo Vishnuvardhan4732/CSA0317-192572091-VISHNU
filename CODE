@@ -1,1 +1,2811 @@
+"""
+Online Examination System  (v2.0)
+Design and Implementation of an Online Examination System Using Data Structures
+for Efficient Question Management and Automated Evaluation
+
+Modules
+  1. Login            - secure authentication, roles, lock-out, session timeout, audit log
+  2. Dashboard        - role based home screen, statistics, notifications, profile
+  3. Question Bank    - add / edit / delete / search, bulk paste, CSV import & export
+  4. Exam             - scheduling windows, timer, auto-submit, shuffle, negative marking,
+                        question navigator, review flags, proctoring warnings, live monitoring
+  5. Results          - instant evaluation, scorecard, answer review, leaderboard, CSV export
+  6. Reports          - analytics charts, hardest questions, audit log
+  7. User management  - admin: add / bulk add / edit / reset password / delete users
+
+Data structures used: hash maps (dict), queue (deque), heap (heapq), sets, lists.
+"""
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import sqlite3
+import hashlib
+import hmac
+import os
+import re
+import csv
+import difflib
+import time
+import heapq
+import random
+from collections import deque
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+
+APP_NAME = "Online Examination System"
+APP_VERSION = "2.0"
+
+INACTIVITY_SECONDS = 300          # auto-logout after 5 minutes of no activity
+MAX_FAILED_LOGINS = 5             # lock an account after this many wrong passwords ...
+LOCK_SECONDS = 60                 # ... for this many seconds
+MAX_PROCTOR_WARNINGS = 3          # leaving the exam window this many times auto-submits
+DT_FMT = "%Y-%m-%d %H:%M"
+
+# ------------------------------------------------------------------
+# COLOUR THEME
+# ------------------------------------------------------------------
+PAGE_BG = "#eef2f7"
+NAVY = "#1d3557"
+ROLE_COLORS = {"admin": "#8338ec", "teacher": "#1982c4", "student": "#2a9d8f"}
+C_BLUE, C_RED, C_GREEN = "#1982c4", "#e63946", "#2a9d8f"
+C_ORANGE, C_PURPLE, C_PINK, C_YELLOW = "#f77f00", "#8338ec", "#ef476f", "#ffb703"
+C_GRAY = "#6c757d"
+TILE_COLORS = [C_BLUE, C_ORANGE, C_GREEN, C_PURPLE]
+CHART_COLORS = [C_BLUE, C_ORANGE, C_GREEN, C_PURPLE, C_PINK, C_YELLOW, C_RED]
+
+
+def now_str():
+    return datetime.now().strftime(DT_FMT)
+
+
+def fmt_secs(seconds):
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def darken(hex_color, factor=0.82):
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % (int(r * factor), int(g * factor), int(b * factor))
+
+
+def blend(c1, c2, t):
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(int(x + (y - x) * t) for x, y in zip(a, b))
+
+
+class HoverButton(tk.Button):
+    """Flat coloured button that darkens on hover."""
+
+    def __init__(self, parent, text="", color=NAVY, **kw):
+        kw.setdefault("fg", "white")
+        kw.setdefault("relief", "flat")
+        kw.setdefault("cursor", "hand2")
+        kw.setdefault("font", ("Segoe UI", 10, "bold"))
+        kw.setdefault("padx", 10)
+        kw.setdefault("pady", 6)
+        super().__init__(parent, text=text, bg=color, activebackground=darken(color),
+                         activeforeground=kw["fg"], disabledforeground="#e9ecef", **kw)
+        self.base = color
+        self.bind("<Enter>", lambda e: self._hover(True))
+        self.bind("<Leave>", lambda e: self._hover(False))
+
+    def _hover(self, on):
+        if str(self["state"]) != "disabled":
+            self.config(bg=darken(self.base) if on else self.base)
+
+
+def card(parent, color, **kw):
+    """White card with a coloured border."""
+    return tk.Frame(parent, bg="white", highlightbackground=color, highlightthickness=2, **kw)
+
+
+def panel_title(parent, text, color):
+    tk.Label(parent, text=text, bg=color, fg="white", anchor="w", padx=14, pady=7,
+             font=("Segoe UI", 11, "bold")).pack(fill="x")
+
+
+def zebra(tree):
+    for i, iid in enumerate(tree.get_children()):
+        tree.item(iid, tags=("odd" if i % 2 else "even",))
+
+
+def style_tree(tree, accent):
+    tree.tag_configure("even", background="white")
+    tree.tag_configure("odd", background=blend("#ffffff", accent, 0.12))
+
+
+class GradientCanvas(tk.Canvas):
+    def __init__(self, parent, c1, c2, on_draw=None, **kw):
+        super().__init__(parent, highlightthickness=0, **kw)
+        self.c1, self.c2, self.on_draw = c1, c2, on_draw
+        self.bind("<Configure>", self._draw)
+
+    def _draw(self, _=None):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        step = 4
+        for i in range(0, h, step):
+            self.create_rectangle(0, i, w, i + step, fill=blend(self.c1, self.c2, i / max(h, 1)), outline="")
+        if self.on_draw:
+            self.on_draw(self, w, h)
+
+
+def draw_bar_chart(canvas, data, max_value=None, integer=False, suffix=""):
+    """Draw a simple bar chart on a Canvas. data = [(label, value), ...]."""
+    canvas.delete("all")
+    w, h = canvas.winfo_width(), canvas.winfo_height()
+    if w < 80 or h < 80:
+        return
+    if not data:
+        canvas.create_text(w / 2, h / 2, text="No data yet", fill="#868e96", font=("Segoe UI", 11))
+        return
+    top_value = max_value or max(1, max(v for _, v in data))
+    left, right, top, bottom = 44, 16, 18, 46
+    plot_w, plot_h = w - left - right, h - top - bottom
+    for i in range(5):                                           # grid lines + y labels
+        y = top + plot_h * (1 - i / 4)
+        canvas.create_line(left, y, w - right, y, fill="#e9ecef")
+        val = top_value * i / 4
+        canvas.create_text(left - 6, y, text=str(int(round(val))) if integer or top_value >= 10 else f"{val:.1f}",
+                           anchor="e", fill="#868e96", font=("Segoe UI", 8))
+    slot = plot_w / len(data)
+    bar_w = min(64, slot * 0.6)
+    for i, (label, value) in enumerate(data):
+        x0 = left + slot * i + (slot - bar_w) / 2
+        y1 = top + plot_h
+        y0 = y1 - plot_h * min(value, top_value) / top_value
+        canvas.create_rectangle(x0, y0, x0 + bar_w, y1, fill=CHART_COLORS[i % len(CHART_COLORS)], outline="")
+        shown = f"{int(value)}" if integer else f"{value:.1f}{suffix}"
+        canvas.create_text(x0 + bar_w / 2, y0 - 8, text=shown, fill="#212529", font=("Segoe UI", 9, "bold"))
+        label = label if len(label) <= 14 else label[:13] + "…"
+        canvas.create_text(x0 + bar_w / 2, y1 + 14, text=label, fill="#495057", font=("Segoe UI", 8))
+
+
+# ============================================================
+# DATABASE (centralised storage) + AUDIT LOG
+# ============================================================
+class Database:
+    """Single SQLite file shared by every module."""
+
+    def __init__(self, path="exam_data.db"):
+        self.path = path
+        self._init_db()
+
+    def connect(self):
+        return sqlite3.connect(self.path)
+
+    @staticmethod
+    def _ensure_columns(cur, table, columns):
+        """Add missing columns so databases made by older versions keep working.
+        Returns the set of columns that were just added."""
+        existing = {r[1] for r in cur.execute(f"PRAGMA table_info({table})")}
+        added = set()
+        for col, ddl in columns.items():
+            if col not in existing:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+                added.add(col)
+        return added
+
+    def _init_db(self):
+        conn = self.connect()
+        cur = conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, salt TEXT NOT NULL,
+            role TEXT NOT NULL, full_name TEXT)""")
+        self._ensure_columns(cur, "users", {"email": "TEXT DEFAULT ''", "phone": "TEXT DEFAULT ''",
+                                            "department": "TEXT DEFAULT ''"})
+        cur.execute("""CREATE TABLE IF NOT EXISTS questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT, topic TEXT, difficulty TEXT,
+            qtype TEXT, text TEXT, option_a TEXT, option_b TEXT, option_c TEXT, option_d TEXT,
+            answer TEXT, marks INTEGER DEFAULT 1)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS exams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, subject TEXT,
+            start_time TEXT, duration_min INTEGER, num_questions INTEGER)""")
+        self._ensure_columns(cur, "exams", {"end_time": "TEXT DEFAULT ''", "negative_marking": "REAL DEFAULT 0",
+                                            "shuffle": "INTEGER DEFAULT 1", "pass_percent": "REAL DEFAULT 50"})
+        cur.execute("""CREATE TABLE IF NOT EXISTS results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, exam_id INTEGER, exam_title TEXT,
+            score REAL, total REAL, percentage REAL, grade TEXT, auto_submitted INTEGER,
+            submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+        added = self._ensure_columns(cur, "results", {
+            "correct_count": "INTEGER DEFAULT 0", "wrong_count": "INTEGER DEFAULT 0",
+            "unanswered": "INTEGER DEFAULT 0", "time_taken_sec": "INTEGER DEFAULT 0",
+            "warnings": "INTEGER DEFAULT 0", "passed": "INTEGER DEFAULT 0"})
+        if "passed" in added:                       # results stored by an older version
+            cur.execute("UPDATE results SET passed = CASE WHEN percentage >= 50 THEN 1 ELSE 0 END")
+        cur.execute("""CREATE TABLE IF NOT EXISTS answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, result_id INTEGER, question_id INTEGER, qtype TEXT,
+            question_text TEXT, given TEXT, correct TEXT, awarded REAL, max_marks REAL, status TEXT)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, username TEXT, action TEXT, details TEXT)""")
+        conn.commit()
+        conn.close()
+
+
+class AuditLog:
+    """Who did what, and when (login, exam activity, user and question changes)."""
+
+    def __init__(self, db):
+        self.db = db
+        self.actor = "system"
+
+    def log(self, action, details="", actor=None):
+        try:
+            conn = self.db.connect()
+            conn.execute("INSERT INTO audit_log (timestamp, username, action, details) VALUES (?,?,?,?)",
+                         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), actor or self.actor, action, details))
+            conn.commit()
+            conn.close()
+        except sqlite3.Error:
+            pass                                    # logging must never break the application
+
+    def recent(self, limit=300):
+        conn = self.db.connect()
+        rows = conn.execute("SELECT timestamp, username, action, details FROM audit_log "
+                            "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        conn.close()
+        return rows
+
+
+# ============================================================
+# MODULE 1: Login Module (authentication, roles, sessions, profile, users)
+# ============================================================
+class AuthManager:
+    def __init__(self, db, audit):
+        self.db = db
+        self.audit = audit
+        self.current_user = None          # dict: username, role, full_name
+        self.last_activity = time.time()
+        self.last_error = ""
+        self.failed = {}                  # username -> consecutive wrong passwords (hash map)
+        self.locked_until = {}            # username -> unix time when the lock ends
+        self._seed_users()
+
+    # ---------- password protection (salted PBKDF2 hash) ----------
+    @staticmethod
+    def _hash(password, salt):
+        return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000).hex()
+
+    def register(self, username, password, role, full_name=""):
+        if not username or not password or role not in ROLE_COLORS:
+            raise ValueError("Username, password and a valid role are required")
+        salt = os.urandom(16)
+        conn = self.db.connect()
+        conn.execute("""INSERT INTO users (username, password_hash, salt, role, full_name)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(username) DO UPDATE SET password_hash=excluded.password_hash,
+                        salt=excluded.salt, role=excluded.role, full_name=excluded.full_name""",
+                     (username, self._hash(password, salt), salt.hex(), role, full_name))
+        conn.commit()
+        conn.close()
+
+    def _seed_users(self):
+        conn = self.db.connect()
+        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        conn.close()
+        if count == 0:
+            self.register("admin", "admin123", "admin", "System Administrator")
+            self.register("teacher", "teacher123", "teacher", "Demo Teacher")
+            self.register("student", "student123", "student", "Demo Student")
+
+    def _check(self, username, password):
+        conn = self.db.connect()
+        row = conn.execute("SELECT password_hash, salt, role, full_name FROM users WHERE username=?",
+                           (username,)).fetchone()
+        conn.close()
+        if not row:
+            return None
+        stored, salt, role, full_name = row
+        if hmac.compare_digest(stored, self._hash(password, bytes.fromhex(salt))):
+            return role, full_name
+        return None
+
+    def login(self, username, password):
+        self.last_error = ""
+        remaining = self.locked_until.get(username, 0) - time.time()
+        if remaining > 0:
+            self.last_error = f"Too many failed attempts. Try again in {int(remaining) + 1} seconds."
+            self.audit.log("LOGIN_BLOCKED", "account is locked", actor=username or "unknown")
+            return False
+        found = self._check(username, password)
+        if found:
+            role, full_name = found
+            self.failed.pop(username, None)
+            self.current_user = {"username": username, "role": role, "full_name": full_name or username}
+            self.touch()
+            self.audit.actor = username
+            self.audit.log("LOGIN", f"role={role}")
+            return True
+        count = self.failed.get(username, 0) + 1
+        self.failed[username] = count
+        if count >= MAX_FAILED_LOGINS:
+            self.locked_until[username] = time.time() + LOCK_SECONDS
+            self.failed[username] = 0
+            self.last_error = f"Too many failed attempts. Account locked for {LOCK_SECONDS} seconds."
+        else:
+            self.last_error = f"Invalid username or password.  ({MAX_FAILED_LOGINS - count} attempt(s) left)"
+        self.audit.log("LOGIN_FAILED", "wrong username or password", actor=username or "unknown")
+        return False
+
+    def logout(self):
+        if self.current_user:
+            self.audit.log("LOGOUT")
+        self.current_user = None
+        self.audit.actor = "system"
+
+    def change_password(self, old, new):
+        user = self.current_user["username"]
+        if not self._check(user, old):
+            raise ValueError("Current password is incorrect")
+        if len(new) < 6:
+            raise ValueError("New password must be at least 6 characters")
+        self.register(user, new, self.current_user["role"], self.current_user["full_name"])
+        self.audit.log("PASSWORD_CHANGED")
+
+    # ---------- profile management ----------
+    def get_profile(self):
+        u = self.current_user
+        conn = self.db.connect()
+        row = conn.execute("SELECT full_name, email, phone, department FROM users WHERE username=?",
+                           (u["username"],)).fetchone()
+        conn.close()
+        return {"username": u["username"], "role": u["role"], "full_name": row[0] or "",
+                "email": row[1] or "", "phone": row[2] or "", "department": row[3] or ""}
+
+    def update_profile(self, full_name, email, phone, department):
+        full_name, email, phone, department = (x.strip() for x in (full_name, email, phone, department))
+        if not full_name:
+            raise ValueError("Full name is required")
+        if email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+            raise ValueError("Please enter a valid email address")
+        if phone and not re.match(r"^[0-9+\-\s]{7,15}$", phone):
+            raise ValueError("Phone must be 7-15 digits (you may use + - and spaces)")
+        conn = self.db.connect()
+        conn.execute("UPDATE users SET full_name=?, email=?, phone=?, department=? WHERE username=?",
+                     (full_name, email, phone, department, self.current_user["username"]))
+        conn.commit()
+        conn.close()
+        self.current_user["full_name"] = full_name
+        self.audit.log("PROFILE_UPDATED")
+
+    # ---------- user management (admin) ----------
+    def list_users(self):
+        conn = self.db.connect()
+        rows = conn.execute("SELECT username, full_name, role, email, department FROM users "
+                            "ORDER BY role, username").fetchall()
+        conn.close()
+        return rows
+
+    def add_user(self, username, password, role, full_name=""):
+        username = username.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]{3,30}", username):
+            raise ValueError("Username must be 3-30 characters: letters, digits, . _ or -")
+        if len(password) < 6:
+            raise ValueError("Password must be at least 6 characters")
+        if role not in ROLE_COLORS:
+            raise ValueError("Role must be student, teacher or admin")
+        conn = self.db.connect()
+        exists = conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone()
+        conn.close()
+        if exists:
+            raise ValueError(f"Username '{username}' already exists")
+        self.register(username, password, role, full_name.strip())
+        self.audit.log("USER_ADDED", f"{username} ({role})")
+
+    def update_user(self, username, full_name, role, new_password=""):
+        """Admin: change a user's name / role and optionally reset the password."""
+        if not self.has_role("admin"):
+            raise ValueError("Only administrators can edit users")
+        if role not in ROLE_COLORS:
+            raise ValueError("Role must be student, teacher or admin")
+        if new_password and len(new_password) < 6:
+            raise ValueError("New password must be at least 6 characters")
+        conn = self.db.connect()
+        row = conn.execute("SELECT role FROM users WHERE username=?", (username,)).fetchone()
+        if not row:
+            conn.close()
+            raise ValueError("User not found")
+        if row[0] != role:
+            if username == self.current_user["username"]:
+                conn.close()
+                raise ValueError("You cannot change your own role")
+            if row[0] == "admin" and conn.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0] <= 1:
+                conn.close()
+                raise ValueError("Cannot remove the last administrator")
+        conn.execute("UPDATE users SET full_name=?, role=? WHERE username=?", (full_name.strip(), role, username))
+        if new_password:
+            salt = os.urandom(16)
+            conn.execute("UPDATE users SET password_hash=?, salt=? WHERE username=?",
+                         (self._hash(new_password, salt), salt.hex(), username))
+        conn.commit()
+        conn.close()
+        self.audit.log("USER_EDITED", f"{username}" + (" (password reset)" if new_password else ""))
+
+    def delete_user(self, username):
+        if self.current_user and username == self.current_user["username"]:
+            raise ValueError("You cannot delete your own account")
+        conn = self.db.connect()
+        row = conn.execute("SELECT role FROM users WHERE username=?", (username,)).fetchone()
+        if row and row[0] == "admin":
+            admins = conn.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0]
+            if admins <= 1:
+                conn.close()
+                raise ValueError("Cannot delete the last administrator")
+        conn.execute("DELETE FROM users WHERE username=?", (username,))
+        conn.commit()
+        conn.close()
+        self.audit.log("USER_DELETED", username)
+
+    def bulk_add_users(self, text, default_role="student"):
+        """One user per line: username | password | full name [| role]  (tabs or commas also work).
+        Returns (added_count, [error messages])."""
+        added, errors = 0, []
+        for n, raw in enumerate(text.splitlines(), start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            sep = "|" if "|" in line else "\t" if "\t" in line else ","
+            parts = [p.strip() for p in line.split(sep)]
+            if len(parts) < 2:
+                errors.append(f"Line {n}: need at least 'username | password'")
+                continue
+            role = parts[3].lower() if len(parts) > 3 and parts[3] else default_role
+            try:
+                self.add_user(parts[0], parts[1], role, parts[2] if len(parts) > 2 else "")
+                added += 1
+            except ValueError as e:
+                errors.append(f"Line {n}: {e}")
+        return added, errors
+
+    # ---------- session ----------
+    def touch(self):
+        self.last_activity = time.time()
+
+    def session_expired(self):
+        return self.current_user is not None and time.time() - self.last_activity > INACTIVITY_SECONDS
+
+    def has_role(self, *roles):
+        return self.current_user is not None and self.current_user["role"] in roles
+
+
+# ============================================================
+# MODULE 2: Dashboard data (summary statistics)
+# ============================================================
+class DashboardService:
+    def __init__(self, db):
+        self.db = db
+
+    def stats(self, user):
+        conn = self.db.connect()
+        q = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
+        e = conn.execute("SELECT COUNT(*) FROM exams").fetchone()[0]
+        if user["role"] == "student":
+            r, avg = conn.execute("SELECT COUNT(*), AVG(percentage) FROM results WHERE username=?",
+                                  (user["username"],)).fetchone()
+            tiles = {"📚 Questions": q, "📝 Exams": e, "✅ My Results": r, "📈 Avg Score": f"{round(avg or 0, 1)}%"}
+        else:
+            r = conn.execute("SELECT COUNT(*) FROM results").fetchone()[0]
+            u = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            tiles = {"📚 Questions": q, "📝 Exams": e, "✅ Results": r, "👥 Users": u}
+        conn.close()
+        return tiles
+
+    def notifications(self, user):
+        notes = []
+        conn = self.db.connect()
+        now = now_str()
+        for title, start, end in conn.execute("SELECT title, start_time, COALESCE(end_time, '') FROM exams "
+                                              "ORDER BY start_time"):
+            if end and now > end:
+                continue                                       # closed exams are not announced
+            notes.append(f"{'🟢 Live now' if start <= now else '🕒 Upcoming'}:  {title}  ({start}"
+                         + (f"  →  {end}" if end else "") + ")")
+        conn.close()
+        return notes or ["No exams scheduled."]
+
+
+# ============================================================
+# MODULE 3: Question Bank Management Module
+# ============================================================
+class QuestionBank:
+    COLUMNS = ("subject", "topic", "difficulty", "qtype", "text",
+               "option_a", "option_b", "option_c", "option_d", "answer", "marks")
+
+    PASTE_HELP = (
+        "ONE QUESTION PER LINE - separate the parts with  |  (or paste straight from Excel: tabs work too)\n\n"
+        "MCQ (4 options):  Question | Option A | Option B | Option C | Option D | Correct letter\n"
+        "MCQ + marks:      Question | A | B | C | D | Correct letter | Marks\n"
+        "MCQ (2-3 options):Question | Option A | Option B | Correct letter\n"
+        "True/False:       Question | True        (or False)\n"
+        "Descriptive:      Question | keyword1, keyword2, keyword3\n\n"
+        "Leading numbers such as '1.' or 'Q2)' are removed automatically."
+    )
+
+    PASTE_EXAMPLE = (
+        "1. Which principle does a stack follow? | FIFO | LIFO | Random | Priority | B\n"
+        "2. Binary search needs a sorted array. | True\n"
+        "3. A queue is used in BFS. | True\n"
+        "4. Explain recursion. | function, itself, base case, stack\n"
+    )
+
+    def __init__(self, db, audit):
+        self.db = db
+        self.audit = audit
+        self._seed()
+
+    def _validate(self, q):
+        if q["qtype"] not in ("MCQ", "TrueFalse", "Descriptive"):
+            raise ValueError("Type must be MCQ, TrueFalse or Descriptive")
+        if q["difficulty"] not in ("Easy", "Medium", "Hard"):
+            raise ValueError("Difficulty must be Easy, Medium or Hard")
+        if not q["subject"].strip() or not q["text"].strip() or not q["answer"].strip():
+            raise ValueError("Subject, question text and answer are required")
+        if q["qtype"] == "MCQ":
+            if not q["option_a"] or not q["option_b"]:
+                raise ValueError("MCQ needs at least options A and B")
+            letter = q["answer"].strip().upper()
+            if len(letter) != 1 or letter not in "ABCD":
+                raise ValueError("MCQ answer must be A, B, C or D")
+            if not q.get({"A": "option_a", "B": "option_b", "C": "option_c", "D": "option_d"}[letter]):
+                raise ValueError(f"Answer {letter} points to an empty option")
+            q["answer"] = letter
+        if q["qtype"] == "TrueFalse":
+            if q["answer"].strip().lower() not in ("true", "false"):
+                raise ValueError("True/False answer must be True or False")
+            q["answer"] = q["answer"].strip().capitalize()
+        try:
+            q["marks"] = int(q.get("marks") or (2 if q["qtype"] == "Descriptive" else 1))
+        except ValueError:
+            raise ValueError("Marks must be a whole number")
+        if q["marks"] <= 0:
+            raise ValueError("Marks must be greater than zero")
+        return q
+
+    def add(self, q):
+        added, errors = self.add_many([("Question", q)])
+        if errors:
+            raise ValueError(errors[0].split(": ", 1)[-1])
+
+    def add_many(self, items, skip_duplicates=False):
+        """items: list of (label, question-dict). Validates each, then inserts all valid ones in ONE transaction
+        (fast even for thousands of questions). Returns (added_count, [error messages]).
+        With skip_duplicates, a question whose subject + text already exists is skipped."""
+        rows, errors, duplicates = [], [], 0
+        seen = set()
+        if skip_duplicates:
+            conn = self.db.connect()
+            seen = {(s.strip().lower(), t.strip().lower()) for s, t in conn.execute("SELECT subject, text FROM questions")}
+            conn.close()
+        for label, q in items:
+            try:
+                q = self._validate(dict(q))
+                if skip_duplicates:
+                    key = (q["subject"].strip().lower(), q["text"].strip().lower())
+                    if key in seen:
+                        duplicates += 1
+                        continue
+                    seen.add(key)
+                rows.append([q.get(c, "") for c in self.COLUMNS])
+            except ValueError as e:
+                errors.append(f"{label}: {e}")
+        if duplicates:
+            errors.append(f"{duplicates} duplicate question(s) skipped (already in the bank)")
+        if rows:
+            conn = self.db.connect()
+            conn.executemany(
+                f"INSERT INTO questions ({','.join(self.COLUMNS)}) VALUES ({','.join('?' * len(self.COLUMNS))})", rows)
+            conn.commit()
+            conn.close()
+            self.audit.log("QUESTIONS_ADDED", f"{len(rows)} question(s)")
+        return len(rows), errors
+
+    def update(self, qid, q):
+        q = self._validate(dict(q))
+        conn = self.db.connect()
+        conn.execute(f"UPDATE questions SET {','.join(c + '=?' for c in self.COLUMNS)} WHERE id=?",
+                     [q.get(c, "") for c in self.COLUMNS] + [qid])
+        conn.commit()
+        conn.close()
+        self.audit.log("QUESTION_UPDATED", f"id={qid}")
+
+    def delete(self, qid):
+        self.delete_many([qid])
+
+    def delete_many(self, ids):
+        conn = self.db.connect()
+        conn.executemany("DELETE FROM questions WHERE id=?", [(i,) for i in ids])
+        conn.commit()
+        conn.close()
+        self.audit.log("QUESTIONS_DELETED", f"{len(ids)} question(s)")
+
+    def get(self, qid):
+        conn = self.db.connect()
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def search(self, subject="", difficulty="", qtype="", keyword=""):
+        sql, args = "SELECT * FROM questions WHERE 1=1", []
+        for col, val in (("subject", subject), ("difficulty", difficulty), ("qtype", qtype)):
+            if val and val != "All":
+                sql += f" AND {col}=?"
+                args.append(val)
+        if keyword.strip():
+            sql += " AND (text LIKE ? OR topic LIKE ?)"
+            args += [f"%{keyword.strip()}%"] * 2
+        conn = self.db.connect()
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(sql + " ORDER BY id", args)]
+        conn.close()
+        return rows
+
+    def subjects(self):
+        conn = self.db.connect()
+        subs = [r[0] for r in conn.execute("SELECT DISTINCT subject FROM questions ORDER BY subject")]
+        conn.close()
+        return subs
+
+    # ---------- CSV import / export ----------
+    def bulk_upload(self, csv_path):
+        """CSV header: subject,topic,difficulty,qtype,text,option_a..option_d,answer,marks."""
+        items = []
+        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+            for line_no, row in enumerate(csv.DictReader(f), start=2):
+                items.append((f"Line {line_no}", {c: (row.get(c) or "").strip() for c in self.COLUMNS}))
+        return self.add_many(items, skip_duplicates=True)
+
+    def export_csv(self, path, rows):
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(self.COLUMNS)
+            for q in rows:
+                w.writerow([q[c] for c in self.COLUMNS])
+
+    def write_template(self, path):
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(self.COLUMNS)
+            w.writerow(["Data Structures", "Stack", "Easy", "MCQ", "Which principle does a stack follow?",
+                        "FIFO", "LIFO", "Random", "Priority", "B", 1])
+            w.writerow(["Data Structures", "Array", "Easy", "TrueFalse", "Arrays use contiguous memory.",
+                        "", "", "", "", "True", 1])
+            w.writerow(["Data Structures", "Linked List", "Medium", "Descriptive", "Explain a linked list.",
+                        "", "", "", "", "node, pointer, dynamic", 2])
+
+    # ---------- bulk entry: copy & paste ----------
+    def parse_paste(self, text, subject, topic, difficulty):
+        """Turn pasted text (one question per line) into question dicts. Returns (items, errors)."""
+        items, errors = [], []
+        for n, raw in enumerate(text.splitlines(), start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in (line.split("|") if "|" in line else line.split("\t"))]
+            if len(parts) >= 3 and re.fullmatch(r"(?:Q\s*)?\d+\s*[\.\)\:]?", parts[0], flags=re.I):
+                parts = parts[1:]                          # leading serial-number column (e.g. from Excel)
+            parts[0] = re.sub(r"^\s*(?:Q\s*)?\d+\s*[\.\)\:]\s*", "", parts[0], flags=re.I)
+            q = {"subject": subject, "topic": topic, "difficulty": difficulty, "marks": "",
+                 "option_a": "", "option_b": "", "option_c": "", "option_d": ""}
+            n_parts = len(parts)
+            if n_parts >= 6:                               # Q | A | B | C | D | letter [| marks]
+                q.update(qtype="MCQ", text=parts[0], option_a=parts[1], option_b=parts[2],
+                         option_c=parts[3], option_d=parts[4], answer=parts[5])
+                if n_parts >= 7:
+                    q["marks"] = parts[6]
+            elif n_parts in (4, 5):                        # Q | A | B [| C] | letter
+                q.update(qtype="MCQ", text=parts[0], answer=parts[-1])
+                for key, val in zip(("option_a", "option_b", "option_c"), parts[1:-1]):
+                    q[key] = val
+            elif n_parts in (2, 3):                        # Q | True/False  or  Q | keywords  [| marks]
+                q.update(text=parts[0], answer=parts[1])
+                q["qtype"] = "TrueFalse" if parts[1].lower() in ("true", "false") else "Descriptive"
+                if n_parts == 3:
+                    q["marks"] = parts[2]
+            else:
+                errors.append(f"Line {n}: could not recognise the format (use | between the parts)")
+                continue
+            items.append((f"Line {n}", q))
+        return items, errors
+
+    def bulk_paste(self, text, subject, topic, difficulty):
+        if not subject.strip():
+            raise ValueError("Please enter a subject for the pasted questions")
+        subject = next((s for s in self.subjects() if s.lower() == subject.strip().lower()), subject.strip())
+        items, parse_errors = self.parse_paste(text, subject, topic.strip(), difficulty)
+        added, errors = self.add_many(items, skip_duplicates=True)
+        return added, parse_errors + errors
+
+    def _seed(self):
+        if self.search():
+            return
+        S = "Data Structures"
+        sample = [
+            (S, "Stack", "Easy", "MCQ", "Which principle does a stack follow?", "FIFO", "LIFO", "Random", "Priority", "B", 1),
+            (S, "Queue", "Easy", "MCQ", "Which data structure is used for BFS?", "Stack", "Heap", "Queue", "Tree", "C", 1),
+            (S, "Hash Table", "Medium", "MCQ", "Average time to search in a hash table?", "O(n)", "O(log n)", "O(1)", "O(n^2)", "C", 1),
+            (S, "Heap", "Medium", "MCQ", "A min-heap always keeps which element at the root?", "Largest", "Smallest", "Median", "Newest", "B", 1),
+            (S, "Tree", "Medium", "TrueFalse", "A binary search tree can contain duplicate keys in its standard definition.", "", "", "", "", "False", 1),
+            (S, "Array", "Easy", "TrueFalse", "Array elements are stored in contiguous memory.", "", "", "", "", "True", 1),
+            (S, "Sorting", "Hard", "MCQ", "Worst-case time complexity of quicksort?", "O(n log n)", "O(n)", "O(n^2)", "O(log n)", "C", 1),
+            (S, "Linked List", "Medium", "Descriptive", "Explain a linked list and one advantage over arrays.", "", "", "", "",
+             "node,pointer,dynamic,insertion,deletion", 2),
+        ]
+        conn = self.db.connect()
+        rows = []
+        for s in sample:
+            q = self._validate(dict(zip(self.COLUMNS, s)))
+            rows.append([q.get(c, "") for c in self.COLUMNS])
+        conn.executemany(
+            f"INSERT INTO questions ({','.join(self.COLUMNS)}) VALUES ({','.join('?' * len(self.COLUMNS))})", rows)
+        conn.commit()
+        conn.close()
+
+
+# ============================================================
+# MODULE 4: Exam Module (windows, timer, auto-submit, shuffle, proctoring, monitoring)
+# ============================================================
+def prepare_question(q, shuffle):
+    """Copy of a question for one student. MCQ options are shuffled and the answer letter re-mapped."""
+    q = dict(q)
+    if shuffle and q["qtype"] == "MCQ":
+        options = [q["option_" + L.lower()] for L in "ABCD" if q["option_" + L.lower()]]
+        correct_text = q["option_" + q["answer"].lower()]
+        random.shuffle(options)
+        for i, L in enumerate("ABCD"):
+            q["option_" + L.lower()] = options[i] if i < len(options) else ""
+        q["answer"] = "ABCD"[options.index(correct_text)]
+    return q
+
+
+class ExamSession:
+    """One student's running attempt. Questions live in a deque (queue) for navigation."""
+
+    def __init__(self, exam, questions, username):
+        self.exam = exam
+        self.username = username
+        self.questions = list(questions)
+        self.index = 0
+        self.answers = {}                         # question id -> answer (hash map)
+        self.flagged = set()                      # indexes marked for review
+        self.warnings = 0                         # proctoring warnings
+        self.started = datetime.now()
+        deadline = self.started + timedelta(minutes=exam["duration_min"])
+        end = exam.get("end_time") or ""
+        if end:
+            try:
+                deadline = min(deadline, datetime.strptime(end, DT_FMT))
+            except ValueError:
+                pass
+        self.deadline = deadline
+        self.finished = False
+
+    def current(self):
+        return self.questions[self.index]
+
+    def remaining_seconds(self):
+        return max(0, int((self.deadline - datetime.now()).total_seconds()))
+
+    def elapsed_seconds(self):
+        return max(0, int((datetime.now() - self.started).total_seconds()))
+
+    def is_answered(self, i):
+        return bool(str(self.answers.get(self.questions[i]["id"], "")).strip())
+
+    def answered_count(self):
+        return sum(1 for i in range(len(self.questions)) if self.is_answered(i))
+
+
+class ExamManager:
+    def __init__(self, db, question_bank, audit):
+        self.db = db
+        self.qb = question_bank
+        self.audit = audit
+        self.active = {}                          # username -> ExamSession (for live monitoring)
+        self._seed()
+
+    def schedule(self, title, subject, start_time, duration_min, num_questions,
+                 end_time="", negative=0.0, shuffle=True, pass_percent=50.0):
+        try:
+            datetime.strptime(start_time, DT_FMT)
+            end_time = (end_time or "").strip()
+            if end_time:
+                datetime.strptime(end_time, DT_FMT)
+            duration_min, num_questions = int(duration_min), int(num_questions)
+            negative, pass_percent = float(negative), float(pass_percent)
+        except ValueError:
+            raise ValueError("Start/End must be 'YYYY-MM-DD HH:MM' (End is optional); "
+                             "minutes, questions, negative marking and pass % must be numbers")
+        if not title.strip() or not subject.strip():
+            raise ValueError("Title and subject are required")
+        if duration_min <= 0 or num_questions <= 0:
+            raise ValueError("Duration and question count must be positive")
+        if end_time and end_time <= start_time:
+            raise ValueError("End time must be later than the start time")
+        if not 0 <= negative <= 1:
+            raise ValueError("Negative marking must be between 0 and 1 (for example 0.25)")
+        if not 0 <= pass_percent <= 100:
+            raise ValueError("Pass percentage must be between 0 and 100")
+        available = len(self.qb.search(subject=subject))
+        if available == 0:
+            raise ValueError(f"No questions found for subject '{subject}'.\n"
+                             f"Choose a subject that exists in the Question Bank: "
+                             f"{', '.join(self.qb.subjects()) or '(bank is empty)'}")
+        if num_questions > available:
+            raise ValueError(f"Only {available} question(s) available for '{subject}', "
+                             f"but you asked for {num_questions}.")
+        conn = self.db.connect()
+        conn.execute("""INSERT INTO exams (title, subject, start_time, duration_min, num_questions,
+                        end_time, negative_marking, shuffle, pass_percent) VALUES (?,?,?,?,?,?,?,?,?)""",
+                     (title.strip(), subject, start_time, duration_min, num_questions,
+                      end_time, negative, int(bool(shuffle)), pass_percent))
+        conn.commit()
+        conn.close()
+        self.audit.log("EXAM_SCHEDULED", f"{title.strip()} ({start_time})")
+
+    def list_exams(self):
+        conn = self.db.connect()
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute("SELECT * FROM exams ORDER BY start_time")]
+        conn.close()
+        return rows
+
+    def delete(self, exam_id):
+        if any(s.exam["id"] == exam_id for s in self.active.values()):
+            raise ValueError("A student is taking this exam right now, so it cannot be deleted")
+        conn = self.db.connect()
+        conn.execute("DELETE FROM exams WHERE id=?", (exam_id,))
+        conn.commit()
+        conn.close()
+        self.audit.log("EXAM_DELETED", f"id={exam_id}")
+
+    def already_taken(self, username, exam_id):
+        conn = self.db.connect()
+        n = conn.execute("SELECT COUNT(*) FROM results WHERE username=? AND exam_id=?",
+                         (username, exam_id)).fetchone()[0]
+        conn.close()
+        return n > 0
+
+    def status(self, exam, username=None):
+        """Upcoming / Live / Closed  (or Completed for a student who already submitted)."""
+        if username and self.already_taken(username, exam["id"]):
+            return "Completed"
+        now = now_str()
+        if now < exam["start_time"]:
+            return "Upcoming"
+        if (exam.get("end_time") or "") and now > exam["end_time"]:
+            return "Closed"
+        return "Live"
+
+    def start(self, exam, username):
+        status = self.status(exam, username)
+        if status == "Upcoming":
+            raise ValueError(f"This exam opens at {exam['start_time']}.")
+        if status == "Closed":
+            raise ValueError(f"This exam closed at {exam['end_time']}.")
+        if status == "Completed":
+            raise ValueError("You have already submitted this exam.")
+        pool = self.qb.search(subject=exam["subject"])
+        if not pool:
+            raise ValueError("There are no questions for this exam's subject.")
+        picked = random.sample(pool, min(exam["num_questions"], len(pool)))   # random selection
+        if exam.get("shuffle", 1):
+            random.shuffle(picked)
+        questions = deque(prepare_question(q, exam.get("shuffle", 1)) for q in picked)
+        session = ExamSession(exam, questions, username)
+        self.active[username] = session
+        self.audit.log("EXAM_STARTED", exam["title"])
+        return session
+
+    def end(self, username):
+        self.active.pop(username, None)
+
+    def monitoring_rows(self):
+        rows = []
+        for user, s in self.active.items():
+            rows.append((user, s.exam["title"], f"{s.answered_count()}/{len(s.questions)}",
+                         fmt_secs(s.remaining_seconds()), s.warnings))
+        return rows
+
+    def _seed(self):
+        if not self.list_exams():
+            start = (datetime.now() - timedelta(hours=1)).strftime(DT_FMT)
+            self.schedule("Data Structures Quiz 1", "Data Structures", start, 10, 6)
+
+
+# ============================================================
+# MODULE 5: Automatic Result Generation Module (+ analytics queries)
+# ============================================================
+class ResultGenerator:
+    GRADES = [(90, "A+"), (80, "A"), (70, "B"), (60, "C"), (50, "D"), (0, "F")]
+
+    def __init__(self, db, audit):
+        self.db = db
+        self.audit = audit
+
+    def grade_for(self, pct):
+        for cutoff, g in self.GRADES:
+            if pct >= cutoff:
+                return g
+
+    @staticmethod
+    def _option_text(q, letter):
+        return f"{letter}. {q.get('option_' + letter.lower(), '')}"
+
+    def grade_question(self, q, given, negative=0.0):
+        """Returns (marks_awarded, status, given_text, correct_text)."""
+        given = str(given or "").strip()
+        marks, qtype = q["marks"], q["qtype"]
+        if qtype == "MCQ":
+            correct_text = self._option_text(q, q["answer"])
+            given_text = self._option_text(q, given.upper()) if given else "-"
+        elif qtype == "TrueFalse":
+            correct_text, given_text = q["answer"], given or "-"
+        else:
+            correct_text, given_text = "Keywords: " + q["answer"], (given[:300] or "-")
+        if not given:
+            return 0, "Unanswered", given_text, correct_text
+        if qtype in ("MCQ", "TrueFalse"):
+            if given.lower() == q["answer"].lower():
+                return marks, "Correct", given_text, correct_text
+            return -round(marks * negative, 2), "Wrong", given_text, correct_text
+        # Descriptive: keyword matching, proportional marks
+        keywords = [k.strip().lower() for k in q["answer"].split(",") if k.strip()]
+        hits = sum(1 for k in keywords if k in given.lower())
+        awarded = round(marks * hits / len(keywords), 2) if keywords else 0
+        status = "Correct" if keywords and hits == len(keywords) else "Partial" if hits else "Wrong"
+        return awarded, status, given_text, correct_text
+
+    def evaluate_and_store(self, session, auto_submitted=False):
+        negative = float(session.exam.get("negative_marking") or 0)
+        details, score = [], 0.0
+        for q in session.questions:
+            awarded, status, given_text, correct_text = self.grade_question(q, session.answers.get(q["id"]), negative)
+            score += awarded
+            details.append((q["id"], q["qtype"], q["text"], given_text, correct_text, awarded, q["marks"], status))
+        score = round(max(0.0, score), 2)
+        total = sum(q["marks"] for q in session.questions)
+        pct = round(score / total * 100, 2) if total else 0
+        grade = self.grade_for(pct)
+        passed = int(pct >= float(session.exam.get("pass_percent") or 50))
+        correct = sum(1 for d in details if d[7] == "Correct")
+        unanswered = sum(1 for d in details if d[7] == "Unanswered")
+        wrong = len(details) - correct - unanswered
+        conn = self.db.connect()
+        cur = conn.execute("""INSERT INTO results
+            (username, exam_id, exam_title, score, total, percentage, grade, auto_submitted,
+             correct_count, wrong_count, unanswered, time_taken_sec, warnings, passed)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (session.username, session.exam["id"], session.exam["title"], score, total, pct, grade,
+             int(auto_submitted), correct, wrong, unanswered, session.elapsed_seconds(), session.warnings, passed))
+        rid = cur.lastrowid
+        conn.executemany("""INSERT INTO answers (result_id, question_id, qtype, question_text, given, correct,
+                            awarded, max_marks, status) VALUES (?,?,?,?,?,?,?,?,?)""",
+                         [(rid,) + d for d in details])
+        conn.commit()
+        conn.close()
+        self.audit.log("EXAM_SUBMITTED", f"{session.exam['title']}: {score}/{total} ({pct}%)"
+                       + (" [auto]" if auto_submitted else ""), actor=session.username)
+        return self.get(rid)
+
+    def get(self, rid):
+        conn = self.db.connect()
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM results WHERE id=?", (rid,)).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def details(self, rid):
+        conn = self.db.connect()
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute("SELECT * FROM answers WHERE result_id=? ORDER BY id", (rid,))]
+        conn.close()
+        return rows
+
+    def list_results(self, username=None):
+        conn = self.db.connect()
+        conn.row_factory = sqlite3.Row
+        if username:
+            rows = conn.execute("SELECT * FROM results WHERE username=? ORDER BY id DESC", (username,))
+        else:
+            rows = conn.execute("SELECT * FROM results ORDER BY id DESC")
+        out = [dict(r) for r in rows]
+        conn.close()
+        return out
+
+    def user_summary(self, username):
+        rows = self.list_results(username)
+        if not rows:
+            return {"count": 0, "average": 0, "best": 0}
+        pcts = [r["percentage"] for r in rows]
+        return {"count": len(rows), "average": round(sum(pcts) / len(pcts), 1), "best": max(pcts)}
+
+    def leaderboard(self, n=5, username=None):
+        """Top-n using a heap (optionally only one student's own results)."""
+        return heapq.nlargest(n, self.list_results(username), key=lambda r: r["percentage"])
+
+    # ---------- analytics ----------
+    def overall_stats(self):
+        conn = self.db.connect()
+        attempts, avg, passed, best = conn.execute(
+            "SELECT COUNT(*), AVG(percentage), SUM(passed), MAX(percentage) FROM results").fetchone()
+        conn.close()
+        attempts = attempts or 0
+        return {"attempts": attempts, "average": round(avg or 0, 1),
+                "pass_rate": round((passed or 0) / attempts * 100, 1) if attempts else 0,
+                "highest": best or 0}
+
+    def exam_averages(self):
+        conn = self.db.connect()
+        rows = conn.execute("SELECT exam_title, AVG(percentage), COUNT(*) FROM results "
+                            "GROUP BY exam_title ORDER BY MAX(id)").fetchall()
+        conn.close()
+        return [(t, round(a, 1), n) for t, a, n in rows]
+
+    def grade_distribution(self):
+        conn = self.db.connect()
+        counts = dict(conn.execute("SELECT grade, COUNT(*) FROM results GROUP BY grade").fetchall())
+        conn.close()
+        return [(g, counts.get(g, 0)) for _, g in self.GRADES]
+
+    def hardest_questions(self, limit=15):
+        """Questions with the lowest average score across all attempts."""
+        conn = self.db.connect()
+        rows = conn.execute("""SELECT question_text, COUNT(*), AVG(MAX(awarded, 0) * 1.0 / max_marks) * 100
+                               FROM answers WHERE max_marks > 0 GROUP BY question_text
+                               ORDER BY 3 ASC, 2 DESC LIMIT ?""", (limit,)).fetchall()
+        conn.close()
+        return [(t, n, round(p, 1)) for t, n, p in rows]
+
+    def scorecard_text(self, r):
+        status = "PASS" if r.get("passed") else "FAIL"
+        return (
+            "=" * 40 + "\n"
+            "        ONLINE EXAMINATION SCORECARD\n" + "=" * 40 + "\n"
+            f"Student      : {r['username']}\n"
+            f"Exam         : {r['exam_title']}\n"
+            f"Marks        : {r['score']} / {r['total']}\n"
+            f"Percentage   : {r['percentage']}%\n"
+            f"Grade        : {r['grade']}   ({status})\n"
+            f"Correct      : {r.get('correct_count', 0)}\n"
+            f"Wrong        : {r.get('wrong_count', 0)}\n"
+            f"Unanswered   : {r.get('unanswered', 0)}\n"
+            f"Time taken   : {fmt_secs(r.get('time_taken_sec', 0))}\n"
+            f"Warnings     : {r.get('warnings', 0)}\n"
+            f"Submission   : {'Auto (time up / warnings)' if r['auto_submitted'] else 'Manual'}\n"
+            f"Submitted at : {r['submitted_at']}\n" + "=" * 40 + "\n"
+        )
+
+
+# ============================================================
+# APP CONTROLLER + SCREENS
+# ============================================================
+class ExamApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"{APP_NAME} v{APP_VERSION} - Data Structures for Question Management")
+        self.geometry("1280x800")
+        self.minsize(1100, 700)
+        self.configure(bg=PAGE_BG)
+        try:                                   # start maximised (Windows / Linux)
+            self.state("zoomed")
+        except tk.TclError:
+            try:
+                self.attributes("-zoomed", True)
+            except tk.TclError:
+                pass
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._setup_styles()
+
+        # Shared backend objects used by all screens
+        self.db = Database()
+        self.audit = AuditLog(self.db)
+        self.auth = AuthManager(self.db, self.audit)
+        self.dashboard = DashboardService(self.db)
+        self.qbank = QuestionBank(self.db, self.audit)
+        self.exams = ExamManager(self.db, self.qbank, self.audit)
+        self.results = ResultGenerator(self.db, self.audit)
+
+        # status bar (user, exam state, live clock)
+        self.status_bar = tk.Frame(self, bg=NAVY, height=26)
+        self.status_bar.pack(side="bottom", fill="x")
+        self.status_left = tk.Label(self.status_bar, text="", bg=NAVY, fg="white", font=("Segoe UI", 9), padx=12)
+        self.status_left.pack(side="left")
+        self.status_right = tk.Label(self.status_bar, text="", bg=NAVY, fg=C_YELLOW, font=("Segoe UI", 9, "bold"), padx=12)
+        self.status_right.pack(side="right")
+
+        container = tk.Frame(self, bg=PAGE_BG)
+        container.pack(fill="both", expand=True)
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+
+        self.frames = {}
+        for Page in (LoginPage, DashboardPage, QuestionBankPage, ExamPage, ResultPage,
+                     AnalyticsPage, ProfilePage, UsersPage):
+            frame = Page(parent=container, controller=self)
+            self.frames[Page] = frame
+            frame.grid(row=0, column=0, sticky="nsew")
+
+        # session management: any activity resets the inactivity clock
+        for ev in ("<Key>", "<Button>", "<Motion>"):
+            self.bind_all(ev, lambda e: self.auth.touch(), add="+")
+        self.after(5000, self._check_inactivity)
+
+        # proctoring: detect the exam window losing focus (Alt+Tab, clicking another app ...)
+        self._proctor_pause = 0
+        self._away = False
+        self._focus_check_pending = False
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<FocusIn>", self._on_focus_in)
+
+        self._tick_clock()
+        self.show_frame(LoginPage)
+
+    def _setup_styles(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Treeview", rowheight=28, font=("Segoe UI", 10), fieldbackground="white")
+        style.configure("Treeview.Heading", background=NAVY, foreground="white",
+                        font=("Segoe UI", 10, "bold"), relief="flat", padding=6)
+        style.map("Treeview.Heading", background=[("active", C_BLUE)])
+        style.map("Treeview", background=[("selected", C_YELLOW)], foreground=[("selected", "#212529")])
+        style.configure("Exam.Horizontal.TProgressbar", troughcolor="#dee2e6", background=C_GREEN, thickness=14)
+        style.configure("TNotebook", background="white", borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(14, 6), font=("Segoe UI", 10, "bold"), background="#dee2e6")
+        style.map("TNotebook.Tab", background=[("selected", C_ORANGE)], foreground=[("selected", "white")])
+
+    def show_frame(self, page_class):
+        frame = self.frames[page_class]
+        if hasattr(frame, "on_show"):
+            frame.on_show()
+        frame.tkraise()
+
+    # ---------- status bar ----------
+    def _tick_clock(self):
+        user = self.auth.current_user
+        who = f"👤 {user['full_name']}  ·  {user['role'].title()}" if user else "Not logged in"
+        if self.exams.active:
+            who += "   ·   🔴 EXAM IN PROGRESS"
+        self.status_left.config(text=f"{APP_NAME} v{APP_VERSION}   |   {who}")
+        self.status_right.config(text=datetime.now().strftime("%a %d %b %Y  %H:%M:%S"))
+        self.after(1000, self._tick_clock)
+
+    # ---------- session timeout ----------
+    def _check_inactivity(self):
+        exam_running = bool(self.exams.active)
+        if self.auth.session_expired() and not exam_running:
+            self.logout(reason="You were logged out after a period of inactivity.")
+        self.after(5000, self._check_inactivity)
+
+    def logout(self, reason=None):
+        self.auth.logout()
+        self.show_frame(LoginPage)
+        if reason:
+            messagebox.showinfo("Session Ended", reason)
+
+    # ---------- proctoring ----------
+    @contextmanager
+    def proctor_paused(self):
+        """Use around our own dialogs so they are not counted as 'leaving the exam'."""
+        self._proctor_pause += 1
+        try:
+            yield
+        finally:
+            self.after(600, self._resume_proctor)
+
+    def _resume_proctor(self):
+        self._proctor_pause = max(0, self._proctor_pause - 1)
+
+    def _on_focus_in(self, _event):
+        self._away = False
+
+    def _on_focus_out(self, _event):
+        if self.exams.active and not self._proctor_pause and not self._focus_check_pending:
+            self._focus_check_pending = True
+            self.after(300, self._check_focus_lost)
+
+    def _check_focus_lost(self):
+        self._focus_check_pending = False
+        if not self.exams.active or self._proctor_pause or self._away:
+            return
+        if self.focus_displayof() is None:           # the whole application lost focus
+            self._away = True
+            self.frames[ExamPage].proctor_violation()
+
+    def _on_close(self):
+        if self.exams.active and not messagebox.askyesno(
+                "Exam in progress", "An exam is still running. Closing now will lose the attempt.\n\nClose anyway?"):
+            return
+        self.destroy()
+
+    def require_role(self, *roles):
+        if not self.auth.has_role(*roles):
+            messagebox.showerror("Access Denied", "You do not have permission to open this module.")
+            return False
+        return True
+
+
+class LoginPage(tk.Frame):
+    def __init__(self, parent, controller):
+        super().__init__(parent, bg=PAGE_BG)
+        self.controller = controller
+
+        def decorate(canvas, w, h):
+            canvas.create_text(w / 2, 70, text="📝  Online Examination System", fill="white",
+                               font=("Segoe UI", 26, "bold"))
+            canvas.create_text(w / 2, 112, text="Efficient Question Management and Automated Evaluation",
+                               fill="#ffe8a3", font=("Segoe UI", 12))
+            for i, col in enumerate((C_RED, C_YELLOW, C_GREEN, C_BLUE, C_PURPLE)):
+                canvas.create_rectangle(w / 2 - 100 + i * 40, 135, w / 2 - 60 + i * 40, 141, fill=col, outline="")
+            canvas.create_text(w / 2, h - 18, text=f"Version {APP_VERSION}", fill="#dee2e6", font=("Segoe UI", 9))
+
+        self.bg = GradientCanvas(self, "#1d3557", "#8338ec", on_draw=decorate)
+        self.bg.pack(fill="both", expand=True)
+
+        box = tk.Frame(self.bg, bg="white", highlightbackground=C_YELLOW, highlightthickness=3,
+                       width=400, height=410)
+        box.place(relx=0.5, rely=0.58, anchor="center")
+        box.pack_propagate(False)
+
+        tk.Label(box, text="🔐  Secure Login", bg="white", fg=NAVY, font=("Segoe UI", 16, "bold")).pack(pady=(22, 14))
+        self.user_var, self.pass_var = tk.StringVar(), tk.StringVar()
+
+        tk.Label(box, text="Username", bg="white", fg="#495057", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=40)
+        self.user_entry = tk.Entry(box, textvariable=self.user_var, width=30, relief="solid", bd=1,
+                                   font=("Segoe UI", 11))
+        self.user_entry.pack(padx=40, pady=(2, 10), ipady=3)
+        tk.Label(box, text="Password", bg="white", fg="#495057", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=40)
+        self.pw_entry = tk.Entry(box, textvariable=self.pass_var, show="*", width=30, relief="solid", bd=1,
+                                 font=("Segoe UI", 11))
+        self.pw_entry.pack(padx=40, pady=(2, 4), ipady=3)
+        self.pw_entry.bind("<Return>", lambda e: self.login())
+        self.user_entry.bind("<Return>", lambda e: self.pw_entry.focus_set())
+        self.show_pw = tk.BooleanVar(value=False)
+        tk.Checkbutton(box, text="Show password", variable=self.show_pw, bg="white", activebackground="white",
+                       fg="#495057", font=("Segoe UI", 9), cursor="hand2",
+                       command=lambda: self.pw_entry.config(show="" if self.show_pw.get() else "*")
+                       ).pack(anchor="w", padx=36, pady=(0, 10))
+
+        HoverButton(box, "Login  ➜", C_PURPLE, pady=9, command=self.login).pack(padx=40, fill="x")
+        self.msg = tk.Label(box, text="", bg="white", fg=C_RED, font=("Segoe UI", 9, "bold"), wraplength=320)
+        self.msg.pack(pady=(8, 0))
+        tk.Label(box, text="Forgot your password? Contact your administrator.", bg="white", fg="#868e96",
+                 font=("Segoe UI", 8)).pack(pady=(6, 0))
+        tk.Label(box, text="Demo: admin/admin123 · teacher/teacher123 · student/student123",
+                 bg="white", fg="#adb5bd", font=("Segoe UI", 8)).pack(pady=(4, 0))
+
+    def on_show(self):
+        self.user_var.set("")
+        self.pass_var.set("")
+        self.msg.config(text="")
+        self.show_pw.set(False)
+        self.pw_entry.config(show="*")
+        self.user_entry.focus_set()
+
+    def login(self):
+        auth = self.controller.auth
+        if auth.login(self.user_var.get().strip(), self.pass_var.get()):
+            self.controller.show_frame(DashboardPage)
+        else:
+            self.msg.config(text=auth.last_error)
+            self.pass_var.set("")
+
+
+class DashboardPage(tk.Frame):
+    """Home screen after login: stats, notifications, profile, and module cards by role."""
+
+    def __init__(self, parent, controller):
+        super().__init__(parent, bg=PAGE_BG)
+        self.controller = controller
+
+        self.header = tk.Frame(self, bg=NAVY, height=90)
+        self.header.pack(fill="x", side="top")
+        self.avatar = tk.Canvas(self.header, width=54, height=54, highlightthickness=0, bg=NAVY)
+        self.avatar.pack(side="left", padx=(20, 10), pady=18)
+        self.title_label = tk.Label(self.header, bg=NAVY, fg="white", font=("Segoe UI", 18, "bold"))
+        self.title_label.pack(side="left", pady=18)
+        HoverButton(self.header, "⏻ Logout", "#ffffff", fg=NAVY, command=controller.logout).pack(side="right", padx=20)
+        HoverButton(self.header, "👤 My Profile", C_YELLOW, fg="#212529",
+                    command=lambda: controller.show_frame(ProfilePage)).pack(side="right")
+
+        body = tk.Frame(self, bg=PAGE_BG)
+        body.pack(expand=True, fill="both", padx=30, pady=18)
+
+        self.stats_frame = tk.Frame(body, bg=PAGE_BG)
+        self.stats_frame.pack(fill="x")
+
+        tk.Label(body, text="Modules", bg=PAGE_BG, fg=NAVY, font=("Segoe UI", 15, "bold")).pack(anchor="w", pady=(18, 6))
+        self.cards = tk.Frame(body, bg=PAGE_BG)
+        self.cards.pack(fill="x")
+
+        tk.Label(body, text="Notifications", bg=PAGE_BG, fg=NAVY, font=("Segoe UI", 15, "bold")).pack(anchor="w", pady=(18, 6))
+        self.notes = tk.Listbox(body, height=5, font=("Segoe UI", 10), relief="flat", bg="#fff8e1",
+                                fg="#5f370e", highlightbackground=C_YELLOW, highlightthickness=2,
+                                selectbackground=C_YELLOW)
+        self.notes.pack(fill="x")
+
+    def on_show(self):
+        user = self.controller.auth.current_user
+        if not user:
+            return
+        color = ROLE_COLORS[user["role"]]
+        for w in (self.header, self.title_label):
+            w.config(bg=color)
+        self.avatar.config(bg=color)
+        self.avatar.delete("all")
+        self.avatar.create_oval(2, 2, 52, 52, fill="white", outline="")
+        self.avatar.create_text(27, 27, text=user["full_name"][:1].upper(), fill=color, font=("Segoe UI", 20, "bold"))
+        self.title_label.config(text=f"Welcome, {user['full_name']}   ·   {user['role'].title()}")
+
+        for w in self.stats_frame.winfo_children():
+            w.destroy()
+        for (label, value), tile in zip(self.controller.dashboard.stats(user).items(), TILE_COLORS):
+            box = tk.Frame(self.stats_frame, bg=tile, width=230, height=88)
+            box.pack(side="left", padx=(0, 16))
+            box.pack_propagate(False)
+            tk.Label(box, text=str(value), bg=tile, fg="white", font=("Segoe UI", 24, "bold")).pack(pady=(10, 0))
+            tk.Label(box, text=label, bg=tile, fg="white", font=("Segoe UI", 10)).pack()
+
+        for w in self.cards.winfo_children():
+            w.destroy()
+        staff = ("admin", "teacher")
+        modules = [
+            ("📚", "Question Bank", "Add, paste, edit &\nbulk-upload questions", C_BLUE, QuestionBankPage, staff),
+            ("📝", "Exam", "Take, schedule &\nmonitor exams", C_RED, ExamPage, ("admin", "teacher", "student")),
+            ("📊", "Results", "Scorecards, answer\nreview & leaderboard", C_GREEN, ResultPage, ("admin", "teacher", "student")),
+            ("📈", "Analytics", "Charts, hardest\nquestions & audit log", C_ORANGE, AnalyticsPage, staff),
+            ("👤", "My Profile", "Account details &\npassword", C_PURPLE, ProfilePage, ("admin", "teacher", "student")),
+            ("👥", "Manage Users", "Add, edit & reset\nstudents/teachers", C_PINK, UsersPage, ("admin",)),
+        ]
+        for i, (icon, title, desc, col, page, roles) in enumerate(modules):
+            allowed = user["role"] in roles
+            col = col if allowed else "#adb5bd"
+            c = card(self.cards, col, width=172, height=205)
+            c.grid(row=0, column=i, padx=(0, 10), pady=4)
+            c.grid_propagate(False)
+            c.pack_propagate(False)
+            tk.Frame(c, bg=col, height=10).pack(fill="x")
+            tk.Label(c, text=icon, bg="white", font=("Segoe UI Emoji", 24)).pack(pady=(8, 0))
+            tk.Label(c, text=title, bg="white", fg=col, font=("Segoe UI", 12, "bold")).pack()
+            tk.Label(c, text=desc, bg="white", fg="#495057", font=("Segoe UI", 9), justify="center").pack(pady=(2, 8))
+            HoverButton(c, "Open" if allowed else "Restricted", col, padx=12, pady=4,
+                        state="normal" if allowed else "disabled",
+                        command=lambda p=page: self.controller.show_frame(p)).pack()
+
+        self.notes.delete(0, "end")
+        for n in self.controller.dashboard.notifications(user):
+            self.notes.insert("end", "   " + n)
+
+
+class ModulePageBase(tk.Frame):
+    """Common header + 'Back to Dashboard' button shared by all module screens."""
+
+    def __init__(self, parent, controller, title, color):
+        super().__init__(parent, bg=PAGE_BG)
+        self.controller = controller
+        self.color = color
+        self.header = header = tk.Frame(self, bg=color, height=62)
+        header.pack(fill="x", side="top")
+        tk.Frame(self, bg=C_YELLOW, height=4).pack(fill="x", side="top")
+        tk.Label(header, text=title, bg=color, fg="white",
+                 font=("Segoe UI", 16, "bold")).pack(side="left", padx=20, pady=14)
+        HoverButton(header, "⬅ Back to Dashboard", "#ffffff", fg=color, command=self.go_back).pack(side="right", padx=20, pady=13)
+
+    def go_back(self):
+        self.controller.show_frame(DashboardPage)
+
+
+# ------------------------------------------------------------------
+# PROFILE SCREEN
+# ------------------------------------------------------------------
+class ProfilePage(ModulePageBase):
+    def __init__(self, parent, controller):
+        super().__init__(parent, controller, "👤  My Profile", C_PURPLE)
+
+        body = tk.Frame(self, bg=PAGE_BG)
+        body.pack(fill="both", expand=True, padx=14, pady=14)
+
+        # ---------- left: identity card ----------
+        left = card(body, C_PURPLE, width=330)
+        left.pack(side="left", fill="y", padx=(0, 14))
+        left.pack_propagate(False)
+        self.banner = tk.Frame(left, bg=C_PURPLE, height=90)
+        self.banner.pack(fill="x")
+        self.avatar = tk.Canvas(left, width=110, height=110, bg="white", highlightthickness=0)
+        self.avatar.place(x=110, y=35)
+        self.name_label = tk.Label(left, text="", bg="white", fg=NAVY, font=("Segoe UI", 15, "bold"))
+        self.name_label.pack(pady=(70, 0))
+        self.user_label = tk.Label(left, text="", bg="white", fg="#868e96", font=("Segoe UI", 10))
+        self.user_label.pack()
+        self.role_badge = tk.Label(left, text="", fg="white", font=("Segoe UI", 9, "bold"), padx=12, pady=3)
+        self.role_badge.pack(pady=8)
+        self.stats_box = tk.Frame(left, bg="white")
+        self.stats_box.pack(fill="x", padx=20, pady=10)
+
+        # ---------- right: edit profile + password ----------
+        right = tk.Frame(body, bg=PAGE_BG)
+        right.pack(side="left", fill="both", expand=True)
+
+        edit = card(right, C_BLUE)
+        edit.pack(fill="x")
+        panel_title(edit, "✏️  Edit Profile", C_BLUE)
+        form = tk.Frame(edit, bg="white")
+        form.pack(fill="x", padx=20, pady=14)
+        self.vars = {k: tk.StringVar() for k in ("full_name", "email", "phone", "department")}
+        for i, (label, key) in enumerate([("Full Name", "full_name"), ("Email", "email"),
+                                           ("Phone", "phone"), ("Department", "department")]):
+            tk.Label(form, text=label, bg="white", fg="#495057", font=("Segoe UI", 10, "bold"),
+                     width=12, anchor="w").grid(row=i, column=0, pady=5, sticky="w")
+            tk.Entry(form, textvariable=self.vars[key], width=38, relief="solid", bd=1,
+                     font=("Segoe UI", 10)).grid(row=i, column=1, pady=5, ipady=3, sticky="w")
+        HoverButton(edit, "💾  Save Profile", C_BLUE, command=self.save_profile).pack(anchor="w", padx=20, pady=(0, 16))
+
+        pw = card(right, C_ORANGE)
+        pw.pack(fill="x", pady=(14, 0))
+        panel_title(pw, "🔑  Change Password", C_ORANGE)
+        pform = tk.Frame(pw, bg="white")
+        pform.pack(fill="x", padx=20, pady=14)
+        self.pvars = {k: tk.StringVar() for k in ("old", "new", "confirm")}
+        for i, (label, key) in enumerate([("Current", "old"), ("New (min 6)", "new"), ("Confirm new", "confirm")]):
+            tk.Label(pform, text=label, bg="white", fg="#495057", font=("Segoe UI", 10, "bold"),
+                     width=12, anchor="w").grid(row=i, column=0, pady=5, sticky="w")
+            tk.Entry(pform, textvariable=self.pvars[key], show="*", width=38, relief="solid", bd=1,
+                     font=("Segoe UI", 10)).grid(row=i, column=1, pady=5, ipady=3, sticky="w")
+        HoverButton(pw, "🔒  Update Password", C_ORANGE, command=self.change_password).pack(anchor="w", padx=20, pady=(0, 16))
+
+    def on_show(self):
+        p = self.controller.auth.get_profile()
+        color = ROLE_COLORS[p["role"]]
+        self.banner.config(bg=color)
+        self.avatar.delete("all")
+        self.avatar.create_oval(4, 4, 106, 106, fill=color, outline="white", width=5)
+        self.avatar.create_text(55, 55, text=(p["full_name"] or p["username"])[:1].upper(), fill="white",
+                                font=("Segoe UI", 40, "bold"))
+        self.name_label.config(text=p["full_name"] or p["username"])
+        self.user_label.config(text=f"@{p['username']}")
+        self.role_badge.config(text=p["role"].upper(), bg=color)
+        for k, v in self.vars.items():
+            v.set(p[k])
+        for v in self.pvars.values():
+            v.set("")
+
+        for w in self.stats_box.winfo_children():
+            w.destroy()
+        if p["role"] == "student":
+            s = self.controller.results.user_summary(p["username"])
+            items = [("Exams taken", s["count"], C_BLUE), ("Average score", f"{s['average']}%", C_ORANGE),
+                     ("Best score", f"{s['best']}%", C_GREEN)]
+        else:
+            items = [("Questions in bank", len(self.controller.qbank.search()), C_BLUE),
+                     ("Exams scheduled", len(self.controller.exams.list_exams()), C_ORANGE),
+                     ("Results stored", len(self.controller.results.list_results()), C_GREEN)]
+        for label, value, col in items:
+            row = tk.Frame(self.stats_box, bg=blend("#ffffff", col, 0.15))
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=label, bg=row["bg"], fg="#495057", font=("Segoe UI", 10), padx=10, pady=6).pack(side="left")
+            tk.Label(row, text=str(value), bg=row["bg"], fg=col, font=("Segoe UI", 12, "bold"), padx=10).pack(side="right")
+
+    def save_profile(self):
+        try:
+            self.controller.auth.update_profile(*(self.vars[k].get() for k in
+                                                   ("full_name", "email", "phone", "department")))
+            messagebox.showinfo("Saved", "Profile updated successfully.")
+            self.on_show()
+        except ValueError as e:
+            messagebox.showerror("Invalid Data", str(e))
+
+    def change_password(self):
+        v = {k: x.get() for k, x in self.pvars.items()}
+        try:
+            if v["new"] != v["confirm"]:
+                raise ValueError("New password and confirmation do not match")
+            self.controller.auth.change_password(v["old"], v["new"])
+            messagebox.showinfo("Success", "Password updated.")
+            self.on_show()
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
+
+
+# ------------------------------------------------------------------
+# USER MANAGEMENT SCREEN (admin only)
+# ------------------------------------------------------------------
+class UsersPage(ModulePageBase):
+    def __init__(self, parent, controller):
+        super().__init__(parent, controller, "👥  User Management", C_PINK)
+
+        body = tk.Frame(self, bg=PAGE_BG)
+        body.pack(fill="both", expand=True, padx=12, pady=12)
+
+        left = card(body, C_PINK, width=410)
+        left.pack(side="left", fill="y", padx=(0, 12))
+        left.pack_propagate(False)
+        panel_title(left, "➕  Add One User", C_PINK)
+        form = tk.Frame(left, bg="white")
+        form.pack(fill="x", padx=14, pady=8)
+        self.vars = {k: tk.StringVar() for k in ("username", "password", "full_name")}
+        self.role_var = tk.StringVar(value="student")
+        for i, (label, key) in enumerate([("Username", "username"), ("Password", "password"),
+                                           ("Full Name", "full_name")]):
+            tk.Label(form, text=label, bg="white", font=("Segoe UI", 9, "bold")).grid(row=i, column=0, sticky="w")
+            tk.Entry(form, textvariable=self.vars[key], width=28, relief="solid", bd=1).grid(row=i, column=1, pady=2)
+        tk.Label(form, text="Role", bg="white", font=("Segoe UI", 9, "bold")).grid(row=3, column=0, sticky="w")
+        ttk.Combobox(form, textvariable=self.role_var, values=["student", "teacher", "admin"],
+                     state="readonly", width=25).grid(row=3, column=1, pady=2)
+        HoverButton(left, "➕  Add User", C_PINK, pady=4, command=self.add_user).pack(padx=14, pady=(2, 10), fill="x")
+
+        panel_title(left, "📋  Bulk Add Users (paste)", C_GREEN)
+        tk.Label(left, text="One user per line:   username | password | Full Name\n"
+                            "(or copy 3 columns from Excel). Password: 6+ characters.",
+                 bg="white", fg="#495057", font=("Consolas", 8), justify="left").pack(anchor="w", padx=14, pady=(6, 2))
+        self.bulk_box = tk.Text(left, height=8, width=44, font=("Consolas", 9), relief="solid", bd=1)
+        self.bulk_box.pack(padx=14, fill="x")
+        row = tk.Frame(left, bg="white")
+        row.pack(fill="x", padx=14, pady=6)
+        tk.Label(row, text="Role for all:", bg="white", font=("Segoe UI", 9, "bold")).pack(side="left")
+        self.bulk_role = tk.StringVar(value="student")
+        ttk.Combobox(row, textvariable=self.bulk_role, values=["student", "teacher", "admin"],
+                     state="readonly", width=10).pack(side="left", padx=6)
+        HoverButton(row, "💡 Example", C_ORANGE, pady=2, command=self.insert_example).pack(side="right")
+        HoverButton(left, "✅  Add All Users", C_GREEN, pady=4, command=self.bulk_add).pack(padx=14, pady=(0, 10), fill="x")
+
+        right = card(body, C_PINK)
+        right.pack(side="left", fill="both", expand=True)
+        panel_title(right, "🗄  All Users", NAVY)
+        bottom = tk.Frame(right, bg="white")
+        bottom.pack(side="bottom", fill="x", padx=14, pady=(0, 14))
+        HoverButton(bottom, "✏️  Edit / Reset Password", C_BLUE, pady=4, command=self.edit_user).pack(side="left")
+        HoverButton(bottom, "🗑  Delete Selected User(s)", C_RED, pady=4, command=self.delete_users).pack(side="right")
+        holder = tk.Frame(right, bg="white")
+        holder.pack(fill="both", expand=True, padx=14, pady=14)
+        cols = ("Username", "Full Name", "Role", "Email", "Department")
+        self.tree = ttk.Treeview(holder, columns=cols, show="headings")
+        for c, w in zip(cols, (120, 170, 90, 180, 120)):
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=w, anchor="center")
+        sb = ttk.Scrollbar(holder, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        for role, col in ROLE_COLORS.items():
+            self.tree.tag_configure(role, background=blend("#ffffff", col, 0.15))
+
+    def on_show(self):
+        if not self.controller.require_role("admin"):
+            self.after(10, self.go_back)
+            return
+        self.refresh()
+
+    def refresh(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        for username, full_name, role, email, dept in self.controller.auth.list_users():
+            self.tree.insert("", "end", iid=username, tags=(role,),
+                             values=(username, full_name or "", role, email or "", dept or ""))
+
+    def add_user(self):
+        try:
+            self.controller.auth.add_user(self.vars["username"].get(), self.vars["password"].get(),
+                                          self.role_var.get(), self.vars["full_name"].get())
+        except ValueError as e:
+            return messagebox.showerror("Invalid Data", str(e))
+        messagebox.showinfo("Success", f"User '{self.vars['username'].get().strip()}' added.")
+        for v in self.vars.values():
+            v.set("")
+        self.refresh()
+
+    def insert_example(self):
+        self.bulk_box.delete("1.0", "end")
+        self.bulk_box.insert("1.0", "stud101 | pass1234 | Anil Kumar\nstud102 | pass1234 | Priya Sharma\n"
+                                    "stud103 | pass1234 | Rahul Verma\n")
+
+    def bulk_add(self):
+        text = self.bulk_box.get("1.0", "end")
+        if not text.strip():
+            return messagebox.showwarning("Nothing to add", "Paste at least one line first.")
+        self.config(cursor="watch")
+        self.update_idletasks()          # passwords are hashed securely, so large batches take a moment
+        added, errors = self.controller.auth.bulk_add_users(text, self.bulk_role.get())
+        self.config(cursor="")
+        msg = f"✅ {added} user(s) added."
+        if errors:
+            msg += f"\n\n⚠ {len(errors)} line(s) skipped:\n" + "\n".join(errors[:10])
+            if len(errors) > 10:
+                msg += f"\n... and {len(errors) - 10} more"
+        messagebox.showinfo("Bulk Add Users", msg)
+        if added:
+            self.bulk_box.delete("1.0", "end")
+        self.refresh()
+
+    def edit_user(self):
+        sel = self.tree.selection()
+        if len(sel) != 1:
+            return messagebox.showwarning("Select One User", "Select exactly one user in the table first.")
+        username = sel[0]
+        row = next((u for u in self.controller.auth.list_users() if u[0] == username), None)
+        if not row:
+            return
+        win = tk.Toplevel(self)
+        win.title(f"Edit user: {username}")
+        win.geometry("400x290")
+        win.configure(bg="white")
+        win.transient(self)
+        tk.Label(win, text=f"✏️  Edit  @{username}", bg=C_BLUE, fg="white", anchor="w", padx=14, pady=10,
+                 font=("Segoe UI", 13, "bold")).pack(fill="x")
+        name_var, role_var, pw_var = tk.StringVar(value=row[1] or ""), tk.StringVar(value=row[2]), tk.StringVar()
+        form = tk.Frame(win, bg="white")
+        form.pack(fill="x", padx=20, pady=14)
+        tk.Label(form, text="Full name", bg="white", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w", pady=4)
+        tk.Entry(form, textvariable=name_var, width=28, relief="solid", bd=1).grid(row=0, column=1, pady=4)
+        tk.Label(form, text="Role", bg="white", font=("Segoe UI", 9, "bold")).grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Combobox(form, textvariable=role_var, values=["student", "teacher", "admin"], state="readonly",
+                     width=25).grid(row=1, column=1, pady=4)
+        tk.Label(form, text="New password", bg="white", font=("Segoe UI", 9, "bold")).grid(row=2, column=0, sticky="w", pady=4)
+        tk.Entry(form, textvariable=pw_var, show="*", width=28, relief="solid", bd=1).grid(row=2, column=1, pady=4)
+        tk.Label(win, text="Leave 'New password' empty to keep the current password.", bg="white", fg="#868e96",
+                 font=("Segoe UI", 8)).pack()
+
+        def save():
+            try:
+                self.controller.auth.update_user(username, name_var.get(), role_var.get(), pw_var.get())
+            except ValueError as e:
+                return messagebox.showerror("Cannot Save", str(e), parent=win)
+            messagebox.showinfo("Saved", "User updated.", parent=win)
+            win.destroy()
+            self.refresh()
+        btns = tk.Frame(win, bg="white")
+        btns.pack(pady=14)
+        HoverButton(btns, "💾  Save", C_GREEN, command=save).pack(side="left", padx=6)
+        HoverButton(btns, "Cancel", C_GRAY, command=win.destroy).pack(side="left", padx=6)
+
+    def delete_users(self):
+        names = list(self.tree.selection())
+        if not names:
+            return messagebox.showwarning("No Selection", "Select one or more users in the table first.")
+        if not messagebox.askyesno("Confirm", f"Delete {len(names)} selected user(s)?"):
+            return
+        problems = []
+        for name in names:
+            try:
+                self.controller.auth.delete_user(name)
+            except ValueError as e:
+                problems.append(f"{name}: {e}")
+        if problems:
+            messagebox.showwarning("Some users were not deleted", "\n".join(problems))
+        self.refresh()
+
+
+# ------------------------------------------------------------------
+# QUESTION BANK SCREEN
+# ------------------------------------------------------------------
+class QuestionBankPage(ModulePageBase):
+    def __init__(self, parent, controller):
+        super().__init__(parent, controller, "📚  Question Bank Management", C_BLUE)
+        self.selected_id = None
+
+        # bulk-entry shortcuts in the header bar: always visible, whatever the window size
+        HoverButton(self.header, "📄  Upload CSV", C_PURPLE, padx=12, pady=5,
+                    command=self.bulk_upload).pack(side="right", padx=(0, 8), pady=13)
+        HoverButton(self.header, "📋  BULK PASTE QUESTIONS", C_GREEN, padx=14, pady=5,
+                    command=self.open_paste_dialog).pack(side="right", padx=(0, 8), pady=13)
+
+        body = tk.Frame(self, bg=PAGE_BG)
+        body.pack(fill="both", expand=True, padx=12, pady=12)
+
+        left = card(body, C_BLUE, width=400)
+        left.pack(side="left", fill="y", padx=(0, 12))
+        left.pack_propagate(False)
+
+        # ---- 1) BULK ENTRY at the very top, so it is always visible ----
+        panel_title(left, "📥  Add MANY Questions at Once", C_GREEN)
+        bulk = tk.Frame(left, bg="white")
+        bulk.pack(fill="x", padx=14, pady=8)
+        bulk.columnconfigure(0, weight=1)
+        bulk.columnconfigure(1, weight=1)
+        HoverButton(bulk, "📋  Bulk Paste", C_GREEN, pady=8,
+                    command=self.open_paste_dialog).grid(row=0, column=0, sticky="we", padx=(0, 4))
+        HoverButton(bulk, "📄  Upload CSV", C_PURPLE, pady=8,
+                    command=self.bulk_upload).grid(row=0, column=1, sticky="we", padx=(4, 0))
+
+        # ---- 2) action buttons + note are packed to the BOTTOM first, so they can never be cut off ----
+        actions = tk.Frame(left, bg="white")
+        actions.pack(side="bottom", fill="x", padx=14, pady=(2, 10))
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+        for i, (text, color, cmd) in enumerate([("➕  Add Question", C_BLUE, self.add),
+                                                 ("🔄  Update Selected", C_ORANGE, self.update),
+                                                 ("🗑  Delete Selected", C_RED, self.delete),
+                                                 ("🧨  Delete All Shown", "#b5179e", self.delete_all_shown)]):
+            HoverButton(actions, text, color, pady=4, command=cmd).grid(
+                row=i // 2, column=i % 2, sticky="we", padx=2, pady=2)
+        HoverButton(actions, "🧹  Clear Form", C_GRAY, pady=4, command=self.clear_form).grid(
+            row=2, column=0, columnspan=2, sticky="we", padx=2, pady=2)
+        tk.Label(left, text="*Answer: MCQ = A/B/C/D · True/False = True or False\n"
+                            " Descriptive = comma-separated keywords",
+                 bg="white", fg="#868e96", font=("Segoe UI", 8), justify="left").pack(side="bottom", anchor="w", padx=14)
+
+        # ---- 3) compact single-question form (two fields per row) ----
+        panel_title(left, "✏️  Single Question", C_BLUE)
+        form = tk.Frame(left, bg="white")
+        form.pack(fill="x", padx=14, pady=6)
+        self.vars = {k: tk.StringVar() for k in ("subject", "topic", "option_a", "option_b",
+                                                   "option_c", "option_d", "answer", "marks")}
+        self.vars["difficulty"] = tk.StringVar(value="Easy")
+        self.vars["qtype"] = tk.StringVar(value="MCQ")
+
+        def field(label, key, row, col):
+            tk.Label(form, text=label, bg="white", font=("Segoe UI", 9, "bold")).grid(
+                row=row, column=col, sticky="w", pady=2)
+            if key == "difficulty":
+                w = ttk.Combobox(form, textvariable=self.vars[key], values=["Easy", "Medium", "Hard"],
+                                 state="readonly", width=11)
+            elif key == "qtype":
+                w = ttk.Combobox(form, textvariable=self.vars[key], values=["MCQ", "TrueFalse", "Descriptive"],
+                                 state="readonly", width=11)
+            else:
+                w = tk.Entry(form, textvariable=self.vars[key], width=14, relief="solid", bd=1)
+            w.grid(row=row, column=col + 1, padx=(4, 10), pady=2, sticky="w")
+
+        field("Subject", "subject", 0, 0)
+        field("Topic", "topic", 0, 2)
+        field("Level", "difficulty", 1, 0)
+        field("Type", "qtype", 1, 2)
+        tk.Label(form, text="Question", bg="white", font=("Segoe UI", 9, "bold")).grid(
+            row=2, column=0, columnspan=4, sticky="w")
+        self.text_box = tk.Text(form, width=40, height=3, wrap="word", relief="solid", bd=1)
+        self.text_box.grid(row=3, column=0, columnspan=4, sticky="we", pady=2)
+        field("Option A", "option_a", 4, 0)
+        field("Option B", "option_b", 4, 2)
+        field("Option C", "option_c", 5, 0)
+        field("Option D", "option_d", 5, 2)
+        field("Answer*", "answer", 6, 0)
+        field("Marks", "marks", 6, 2)
+
+        # ---------------- right: filters + table ----------------
+        right = card(body, C_BLUE)
+        right.pack(side="left", fill="both", expand=True)
+        panel_title(right, "🗂  Stored Questions", NAVY)
+        filt = tk.Frame(right, bg="white")
+        filt.pack(fill="x", padx=14, pady=(10, 6))
+        tk.Label(filt, text="Filter:", bg="white", font=("Segoe UI", 10, "bold")).pack(side="left")
+        self.f_subject = tk.StringVar(value="All")
+        self.f_diff = tk.StringVar(value="All")
+        self.f_type = tk.StringVar(value="All")
+        self.f_search = tk.StringVar()
+        self.subject_combo = ttk.Combobox(filt, textvariable=self.f_subject, state="readonly", width=15)
+        self.subject_combo.pack(side="left", padx=3)
+        ttk.Combobox(filt, textvariable=self.f_diff, state="readonly", width=8,
+                     values=["All", "Easy", "Medium", "Hard"]).pack(side="left", padx=3)
+        ttk.Combobox(filt, textvariable=self.f_type, state="readonly", width=11,
+                     values=["All", "MCQ", "TrueFalse", "Descriptive"]).pack(side="left", padx=3)
+        tk.Label(filt, text="🔍", bg="white").pack(side="left", padx=(8, 0))
+        search = tk.Entry(filt, textvariable=self.f_search, width=16, relief="solid", bd=1)
+        search.pack(side="left", padx=3)
+        search.bind("<Return>", lambda e: self.refresh())
+        HoverButton(filt, "Apply", C_BLUE, pady=2, command=self.refresh).pack(side="left", padx=3)
+        HoverButton(filt, "Reset", C_GRAY, pady=2, command=self.reset_filters).pack(side="left", padx=3)
+
+        # bottom bar first (so it is never pushed out of the window)
+        bottom = tk.Frame(right, bg="white")
+        bottom.pack(side="bottom", fill="x", padx=14, pady=(0, 12))
+        HoverButton(bottom, "⬇ CSV Template", C_GRAY, pady=3, command=self.save_template).pack(side="left")
+        HoverButton(bottom, "📤 Export Shown", C_BLUE, pady=3, command=self.export_shown).pack(side="left", padx=6)
+        HoverButton(bottom, "☑ Select All", C_PURPLE, pady=3, command=self.select_all).pack(side="left")
+        self.count_label = tk.Label(bottom, text="", bg="white", fg=C_PURPLE, font=("Segoe UI", 10, "bold"))
+        self.count_label.pack(side="right")
+
+        cols = ("ID", "Subject", "Topic", "Difficulty", "Type", "Question", "Answer")
+        holder = tk.Frame(right, bg="white")
+        holder.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        self.tree = ttk.Treeview(holder, columns=cols, show="headings")
+        for c, w in zip(cols, (45, 110, 90, 75, 85, 320, 80)):
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=w, anchor="w" if c == "Question" else "center")
+        sb = ttk.Scrollbar(holder, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        style_tree(self.tree, C_BLUE)
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.tree.bind("<Control-a>", lambda e: (self.select_all(), "break")[1])
+
+    def on_show(self):
+        if not self.controller.require_role("admin", "teacher"):
+            self.after(10, self.go_back)
+            return
+        self.subject_combo["values"] = ["All"] + self.controller.qbank.subjects()
+        self.refresh()
+
+    def reset_filters(self):
+        self.f_subject.set("All")
+        self.f_diff.set("All")
+        self.f_type.set("All")
+        self.f_search.set("")
+        self.refresh()
+
+    def _shown(self):
+        return self.controller.qbank.search(self.f_subject.get(), self.f_diff.get(), self.f_type.get(),
+                                            self.f_search.get())
+
+    def refresh(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        rows = self._shown()
+        for q in rows:
+            self.tree.insert("", "end", iid=str(q["id"]),
+                             values=(q["id"], q["subject"], q["topic"], q["difficulty"], q["qtype"],
+                                     q["text"], q["answer"]))
+        zebra(self.tree)
+        self.count_label.config(text=f"{len(rows)} question(s)")
+
+    def select_all(self):
+        self.tree.selection_set(self.tree.get_children())
+
+    def _form_data(self):
+        data = {k: v.get().strip() for k, v in self.vars.items()}
+        data["text"] = self.text_box.get("1.0", "end").strip()
+        return data
+
+    def clear_form(self):
+        self.selected_id = None
+        for k, v in self.vars.items():
+            v.set("Easy" if k == "difficulty" else "MCQ" if k == "qtype" else "")
+        self.text_box.delete("1.0", "end")
+
+    def on_select(self, _):
+        sel = self.tree.selection()
+        if len(sel) != 1:          # several rows selected (for deleting): leave the form alone
+            return
+        q = self.controller.qbank.get(int(sel[0]))
+        if not q:
+            return
+        self.selected_id = q["id"]
+        for k, v in self.vars.items():
+            v.set(q[k])
+        self.text_box.delete("1.0", "end")
+        self.text_box.insert("1.0", q["text"])
+
+    def _run(self, action, success):
+        try:
+            action()
+            messagebox.showinfo("Success", success)
+            self.on_show()
+        except ValueError as e:
+            messagebox.showerror("Invalid Data", str(e))
+
+    def add(self):
+        self._run(lambda: self.controller.qbank.add(self._form_data()), "Question added.")
+
+    def update(self):
+        if self.selected_id is None:
+            return messagebox.showwarning("No Selection", "Select a question from the table first.")
+        self._run(lambda: self.controller.qbank.update(self.selected_id, self._form_data()), "Question updated.")
+
+    def delete(self):
+        ids = [int(i) for i in self.tree.selection()]
+        if not ids:
+            return messagebox.showwarning(
+                "No Selection", "Select one or more questions in the table first.\n\n"
+                                "Tip: Ctrl+click or Shift+click to select several, Ctrl+A selects all shown.")
+        if messagebox.askyesno("Confirm", f"Delete {len(ids)} selected question(s)?"):
+            self.controller.qbank.delete_many(ids)
+            self.clear_form()
+            self.on_show()
+
+    def delete_all_shown(self):
+        ids = [int(i) for i in self.tree.get_children()]
+        if not ids:
+            return messagebox.showinfo("Nothing to delete", "No questions are shown in the table.")
+        if messagebox.askyesno("Delete ALL shown questions",
+                               f"This will permanently delete all {len(ids)} question(s) currently shown "
+                               f"(use the filters first to narrow the list).\n\nContinue?", icon="warning"):
+            self.controller.qbank.delete_many(ids)
+            self.clear_form()
+            self.on_show()
+
+    def bulk_upload(self):
+        path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
+        if not path:
+            return
+        try:
+            added, errors = self.controller.qbank.bulk_upload(path)
+        except Exception as e:
+            return messagebox.showerror("Upload Failed", str(e))
+        self._report(added, errors, "CSV Upload")
+
+    def save_template(self):
+        path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile="question_template.csv",
+                                            filetypes=[("CSV file", "*.csv")])
+        if path:
+            self.controller.qbank.write_template(path)
+            messagebox.showinfo("Saved", f"Template saved to:\n{path}\n\nFill it in Excel, then use 'Upload CSV'.")
+
+    def export_shown(self):
+        rows = self._shown()
+        if not rows:
+            return messagebox.showinfo("No Data", "No questions are shown to export.")
+        path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile="question_bank.csv",
+                                            filetypes=[("CSV file", "*.csv")])
+        if path:
+            self.controller.qbank.export_csv(path, rows)
+            messagebox.showinfo("Exported", f"{len(rows)} question(s) saved to:\n{path}")
+
+    def _report(self, added, errors, title, parent=None):
+        msg = f"✅ {added} question(s) added."
+        if errors:
+            msg += f"\n\n⚠ {len(errors)} line(s) skipped:\n" + "\n".join(errors[:10])
+            if len(errors) > 10:
+                msg += f"\n... and {len(errors) - 10} more"
+        messagebox.showinfo(title, msg, parent=parent)
+        self.on_show()
+
+    # ---------- copy & paste many questions at once ----------
+    def open_paste_dialog(self):
+        win = tk.Toplevel(self)
+        win.title("Bulk Paste Questions")
+        win.geometry("880x700")
+        win.minsize(760, 560)
+        win.configure(bg=PAGE_BG)
+        win.transient(self)
+
+        tk.Label(win, text="📋  Paste Questions in Bulk", bg=C_GREEN, fg="white", anchor="w", padx=16, pady=10,
+                 font=("Segoe UI", 15, "bold")).pack(fill="x")
+
+        top = tk.Frame(win, bg=PAGE_BG)
+        top.pack(fill="x", padx=16, pady=10)
+        subject = tk.StringVar(value=self.f_subject.get() if self.f_subject.get() != "All" else "")
+        topic = tk.StringVar()
+        diff = tk.StringVar(value="Medium")
+        tk.Label(top, text="Subject*", bg=PAGE_BG, font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Combobox(top, textvariable=subject, values=self.controller.qbank.subjects(), width=22).grid(row=0, column=1, padx=(4, 16))
+        tk.Label(top, text="Topic", bg=PAGE_BG, font=("Segoe UI", 10, "bold")).grid(row=0, column=2, sticky="w")
+        tk.Entry(top, textvariable=topic, width=20, relief="solid", bd=1).grid(row=0, column=3, padx=(4, 16))
+        tk.Label(top, text="Difficulty", bg=PAGE_BG, font=("Segoe UI", 10, "bold")).grid(row=0, column=4, sticky="w")
+        ttk.Combobox(top, textvariable=diff, values=["Easy", "Medium", "Hard"], state="readonly", width=10).grid(row=0, column=5, padx=4)
+
+        guide = tk.Label(win, text=QuestionBank.PASTE_HELP, bg="#e6f7f4", fg="#1b5e53", justify="left", anchor="w",
+                         font=("Consolas", 9), padx=12, pady=8, highlightbackground=C_GREEN, highlightthickness=1)
+        guide.pack(fill="x", padx=16)
+
+        # buttons + counter are packed at the BOTTOM first so they can never be pushed out of the window
+        btns = tk.Frame(win, bg=PAGE_BG)
+        btns.pack(side="bottom", fill="x", padx=16, pady=(4, 14))
+        status = tk.Label(win, text="0 line(s) detected", bg=PAGE_BG, fg=C_PURPLE, font=("Segoe UI", 10, "bold"))
+        status.pack(side="bottom", anchor="w", padx=16)
+
+        holder = tk.Frame(win, bg=PAGE_BG)
+        holder.pack(fill="both", expand=True, padx=16, pady=10)
+        text = tk.Text(holder, wrap="none", height=8, font=("Consolas", 10), relief="solid", bd=1, undo=True)
+        ys = ttk.Scrollbar(holder, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=ys.set)
+        text.pack(side="left", fill="both", expand=True)
+        ys.pack(side="right", fill="y")
+
+        def update_count(_=None):
+            n = sum(1 for ln in text.get("1.0", "end").splitlines() if ln.strip())
+            status.config(text=f"{n} line(s) detected")
+        text.bind("<KeyRelease>", update_count)
+        text.bind("<<Paste>>", lambda e: win.after(50, update_count))
+
+        def insert_example():
+            text.delete("1.0", "end")
+            text.insert("1.0", QuestionBank.PASTE_EXAMPLE)
+            update_count()
+
+        def submit():
+            content = text.get("1.0", "end")
+            if not content.strip():
+                return messagebox.showwarning("Nothing to add", "Paste some questions first.", parent=win)
+            # guard against typos creating a second subject (e.g. "Data structure" vs "Data Structures")
+            chosen = subject.get().strip()
+            existing = self.controller.qbank.subjects()
+            if chosen and chosen.lower() not in (s.lower() for s in existing) and existing:
+                close = difflib.get_close_matches(chosen, existing, n=1, cutoff=0.75)
+                if close:
+                    ans = messagebox.askyesnocancel(
+                        "Similar subject found",
+                        f"'{chosen}' is not an existing subject.\n\nDid you mean '{close[0]}'?\n\n"
+                        f"Yes = use '{close[0]}'\nNo = create new subject '{chosen}'\nCancel = go back", parent=win)
+                    if ans is None:
+                        return
+                    if ans:
+                        subject.set(close[0])
+                elif not messagebox.askyesno("New subject", f"'{chosen}' is a new subject.\nCreate it?", parent=win):
+                    return
+            try:
+                added, errors = self.controller.qbank.bulk_paste(content, subject.get(), topic.get(), diff.get())
+            except ValueError as e:
+                return messagebox.showerror("Missing Data", str(e), parent=win)
+            self._report(added, errors, "Bulk Paste", parent=win)
+            if added:
+                win.destroy()
+
+        HoverButton(btns, "✅  Add All Questions", C_GREEN, command=submit).pack(side="left")
+        HoverButton(btns, "💡  Insert Example", C_ORANGE, command=insert_example).pack(side="left", padx=8)
+        HoverButton(btns, "🧹  Clear", C_GRAY, command=lambda: (text.delete("1.0", "end"), update_count())).pack(side="left")
+        HoverButton(btns, "Close", C_RED, command=win.destroy).pack(side="right")
+        text.focus_set()
+
+
+# ------------------------------------------------------------------
+# EXAM SCREEN
+# ------------------------------------------------------------------
+STATUS_COLORS = {"Live": "#d8f3dc", "Upcoming": "#fff3bf", "Closed": "#e9ecef", "Completed": "#d0ebff"}
+
+
+class ExamPage(ModulePageBase):
+    def __init__(self, parent, controller):
+        super().__init__(parent, controller, "📝  Exam Module", C_RED)
+        self.session = None
+        self.timer_job = None
+        self.monitor_job = None
+
+        body = tk.Frame(self, bg=PAGE_BG)
+        body.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # ---------- left: exam list / scheduling / monitoring ----------
+        self.left = card(body, C_RED, width=440)
+        self.left.pack(side="left", fill="y", padx=(0, 12))
+        self.left.pack_propagate(False)
+        panel_title(self.left, "📅  Exams", C_RED)
+        self.exam_tree = ttk.Treeview(self.left, columns=("Title", "Start", "End", "Status"), show="headings", height=4)
+        for c, w in (("Title", 130), ("Start", 105), ("End", 105), ("Status", 75)):
+            self.exam_tree.heading(c, text=c)
+            self.exam_tree.column(c, width=w, anchor="center")
+        for status, col in STATUS_COLORS.items():
+            self.exam_tree.tag_configure(status, background=col)
+        self.exam_tree.pack(fill="x", padx=14, pady=8)
+        self.start_btn = HoverButton(self.left, "▶  Start Selected Exam", C_RED, pady=8, command=self.start_exam)
+        self.start_btn.pack(padx=14, pady=(0, 8), fill="x")
+
+        # staff-only widgets: a notebook with 'Schedule' and 'Live Monitor' tabs
+        self.staff_frame = tk.Frame(self.left, bg="white")
+        self.staff_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        nb = ttk.Notebook(self.staff_frame)
+        nb.pack(fill="both", expand=True)
+        sched_tab = tk.Frame(nb, bg="white")
+        mon_tab = tk.Frame(nb, bg="white")
+        nb.add(sched_tab, text="🗓 Schedule")
+        nb.add(mon_tab, text="📡 Live Monitor")
+
+        f = tk.Frame(sched_tab, bg="white")
+        f.pack(fill="x", padx=8, pady=8)
+        self.s_vars = {k: tk.StringVar() for k in ("title", "subject", "start", "end", "duration", "count",
+                                                    "negative", "pass_pct")}
+        self.s_vars["duration"].set("30")
+        self.s_vars["count"].set("5")
+        self.s_vars["negative"].set("0")
+        self.s_vars["pass_pct"].set("50")
+        self.s_vars["start"].set(now_str())
+        self.shuffle_var = tk.BooleanVar(value=True)
+
+        def lbl(text, r, c):
+            tk.Label(f, text=text, bg="white", font=("Segoe UI", 9, "bold")).grid(row=r, column=c, sticky="w", pady=2)
+
+        def ent(key, r, c, width=14, span=1):
+            tk.Entry(f, textvariable=self.s_vars[key], width=width, relief="solid", bd=1).grid(
+                row=r, column=c, columnspan=span, padx=(4, 10), pady=2, sticky="w")
+
+        lbl("Title", 0, 0)
+        ent("title", 0, 1, width=36, span=3)
+        lbl("Subject", 1, 0)
+        self.subject_combo = ttk.Combobox(f, textvariable=self.s_vars["subject"], state="readonly", width=13)
+        self.subject_combo.grid(row=1, column=1, padx=(4, 10), pady=2, sticky="w")
+        lbl("Minutes", 1, 2)
+        ent("duration", 1, 3, width=8)
+        lbl("Start", 2, 0)
+        ent("start", 2, 1, width=16)
+        lbl("End", 2, 2)
+        ent("end", 2, 3, width=16)
+        lbl("Questions", 3, 0)
+        ent("count", 3, 1, width=8)
+        lbl("Pass %", 3, 2)
+        ent("pass_pct", 3, 3, width=8)
+        lbl("Negative", 4, 0)
+        ttk.Combobox(f, textvariable=self.s_vars["negative"], values=["0", "0.25", "0.33", "0.5", "1"],
+                     width=6).grid(row=4, column=1, padx=(4, 10), pady=2, sticky="w")
+        tk.Checkbutton(f, text="Shuffle", variable=self.shuffle_var, bg="white", activebackground="white",
+                       font=("Segoe UI", 9, "bold")).grid(row=4, column=2, columnspan=2, sticky="w")
+        tk.Label(sched_tab, text="Format YYYY-MM-DD HH:MM · End is optional · Negative = fraction of the marks\n"
+                                 "deducted for a wrong MCQ/True-False answer (0 = none, 0.25 = ¼ mark).",
+                 bg="white", fg="#868e96", font=("Segoe UI", 8), justify="left").pack(anchor="w", padx=8)
+        HoverButton(sched_tab, "Schedule Exam", C_BLUE, pady=4, command=self.schedule).pack(padx=8, pady=(6, 2), fill="x")
+        HoverButton(sched_tab, "🗑  Delete Selected Exam", C_RED, pady=4,
+                    command=self.delete_exam).pack(padx=8, pady=(2, 8), fill="x")
+
+        self.mon_tree = ttk.Treeview(mon_tab, columns=("Student", "Exam", "Done", "Left", "Warn"),
+                                     show="headings", height=6)
+        for c, w in (("Student", 80), ("Exam", 120), ("Done", 55), ("Left", 55), ("Warn", 45)):
+            self.mon_tree.heading(c, text=c)
+            self.mon_tree.column(c, width=w, anchor="center")
+        self.mon_tree.pack(fill="x", padx=8, pady=8)
+        style_tree(self.mon_tree, C_GREEN)
+        tk.Label(mon_tab, text="Warn = times the student left the exam window.", bg="white", fg="#868e96",
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=8)
+
+        # ---------- right: exam-taking area ----------
+        self.right = card(body, C_RED)
+        self.right.pack(side="left", fill="both", expand=True)
+        bar = tk.Frame(self.right, bg=NAVY)
+        bar.pack(fill="x")
+        self.exam_title = tk.Label(bar, text="No exam in progress", bg=NAVY, fg="white", font=("Segoe UI", 13, "bold"),
+                                   padx=14, pady=10)
+        self.exam_title.pack(side="left")
+        self.timer_label = tk.Label(bar, text="", bg=NAVY, fg=C_YELLOW, font=("Consolas", 18, "bold"), padx=14)
+        self.timer_label.pack(side="right")
+
+        # navigation buttons first (bottom) so they can never be cut off
+        nav = tk.Frame(self.right, bg="white")
+        nav.pack(side="bottom", fill="x", padx=16, pady=12)
+        self.prev_btn = HoverButton(nav, "⬅ Previous", C_PURPLE, command=self.prev_q)
+        self.next_btn = HoverButton(nav, "Next ➡", C_BLUE, command=self.next_q)
+        self.submit_btn = HoverButton(nav, "✔ Submit Exam", C_GREEN, command=self.submit_clicked)
+        self.prev_btn.pack(side="left")
+        self.next_btn.pack(side="left", padx=8)
+        self.submit_btn.pack(side="right")
+
+        info = tk.Frame(self.right, bg="white")
+        info.pack(fill="x", padx=16, pady=(10, 0))
+        self.progress_label = tk.Label(info, text="", bg="white", fg=C_PURPLE, font=("Segoe UI", 10, "bold"))
+        self.progress_label.pack(side="left")
+        self.warn_label = tk.Label(info, text="", bg="white", fg=C_RED, font=("Segoe UI", 10, "bold"))
+        self.warn_label.pack(side="right")
+        self.progress = ttk.Progressbar(self.right, style="Exam.Horizontal.TProgressbar", maximum=100)
+        self.progress.pack(fill="x", padx=16, pady=(4, 0))
+
+        content = tk.Frame(self.right, bg="white")
+        content.pack(fill="both", expand=True, padx=16, pady=8)
+        # question navigator (right column)
+        pal = tk.Frame(content, bg="white", width=210)
+        pal.pack(side="right", fill="y", padx=(12, 0))
+        pal.pack_propagate(False)
+        tk.Label(pal, text="🧭  Question Navigator", bg=NAVY, fg="white", anchor="w", padx=8, pady=5,
+                 font=("Segoe UI", 10, "bold")).pack(fill="x")
+        self.pal_grid = tk.Frame(pal, bg="white")
+        self.pal_grid.pack(fill="x", pady=6)
+        legend = tk.Frame(pal, bg="white")
+        legend.pack(fill="x", pady=4)
+        for text, col in (("Answered", C_GREEN), ("Not answered", "#ced4da"), ("Flagged", C_ORANGE), ("Current", NAVY)):
+            row = tk.Frame(legend, bg="white")
+            row.pack(anchor="w")
+            tk.Label(row, bg=col, width=2).pack(side="left", padx=(0, 6), pady=1)
+            tk.Label(row, text=text, bg="white", fg="#495057", font=("Segoe UI", 8)).pack(side="left")
+
+        # question area (left column)
+        qcol = tk.Frame(content, bg="white")
+        qcol.pack(side="left", fill="both", expand=True)
+        self.q_label = tk.Label(qcol, text="Select an exam on the left and click Start.", bg="#fff8e1", fg="#212529",
+                                font=("Segoe UI", 13), wraplength=520, justify="left", anchor="w", padx=14, pady=14)
+        self.q_label.pack(fill="x", pady=(0, 10))
+        self.q_label.bind("<Configure>", lambda e: self.q_label.config(wraplength=max(300, e.width - 30)))
+
+        self.answer_var = tk.StringVar()
+        self.options_frame = tk.Frame(qcol, bg="white")
+        self.options_frame.pack(anchor="w", padx=10)
+        self.desc_box = tk.Text(qcol, height=7, width=60, wrap="word", relief="solid", bd=1)
+        self.desc_box.bind("<KeyRelease>", lambda e: self._on_answer())
+        self.flag_var = tk.BooleanVar(value=False)
+        self.flag_btn = tk.Checkbutton(qcol, text="🚩  Mark this question for review", variable=self.flag_var,
+                                       bg="white", activebackground="white", fg=C_ORANGE, font=("Segoe UI", 10, "bold"),
+                                       cursor="hand2", command=self.toggle_flag)
+        self.flag_btn.pack(side="bottom", anchor="w", pady=6)
+        self._set_nav_state(False)
+
+    # ---------- screen lifecycle ----------
+    def on_show(self):
+        staff = self.controller.auth.has_role("admin", "teacher")
+        if staff:
+            self.staff_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        else:
+            self.staff_frame.pack_forget()
+        is_student = self.controller.auth.has_role("student")
+        self.start_btn.config(state="normal" if is_student else "disabled",
+                              text="▶  Start Selected Exam" if is_student else "Exams are taken by students")
+        subjects = self.controller.qbank.subjects()
+        self.subject_combo["values"] = subjects
+        if self.s_vars["subject"].get() not in subjects:
+            self.s_vars["subject"].set(subjects[0] if subjects else "")
+        self.refresh_exams()
+        self._monitor_tick()
+
+    def go_back(self):
+        if self.session and not self.session.finished:
+            with self.controller.proctor_paused():
+                messagebox.showwarning("Exam in Progress", "Please submit your exam before leaving this screen.")
+            return
+        if self.monitor_job:
+            self.after_cancel(self.monitor_job)
+            self.monitor_job = None
+        super().go_back()
+
+    def refresh_exams(self):
+        previous = self.exam_tree.selection()
+        for row in self.exam_tree.get_children():
+            self.exam_tree.delete(row)
+        username = self.controller.auth.current_user["username"] if self.controller.auth.has_role("student") else None
+        for e in self.controller.exams.list_exams():
+            status = self.controller.exams.status(e, username)
+            self.exam_tree.insert("", "end", iid=str(e["id"]), tags=(status,),
+                                  values=(e["title"], e["start_time"], e.get("end_time") or "—", status))
+        children = self.exam_tree.get_children()
+        if children:                      # keep the old selection, otherwise pre-select the first exam
+            self.exam_tree.selection_set(previous[0] if previous and previous[0] in children else children[0])
+
+    def _monitor_tick(self):
+        if self.monitor_job:
+            self.after_cancel(self.monitor_job)
+            self.monitor_job = None
+        if not self.controller.auth.has_role("admin", "teacher"):
+            return
+        for row in self.mon_tree.get_children():
+            self.mon_tree.delete(row)
+        for r in self.controller.exams.monitoring_rows():
+            self.mon_tree.insert("", "end", values=r)
+        zebra(self.mon_tree)
+        self.monitor_job = self.after(2000, self._monitor_tick)
+
+    def schedule(self):
+        v = {k: x.get().strip() for k, x in self.s_vars.items()}
+        try:
+            self.controller.exams.schedule(v["title"], v["subject"], v["start"], v["duration"], v["count"],
+                                           end_time=v["end"], negative=v["negative"] or 0,
+                                           shuffle=self.shuffle_var.get(), pass_percent=v["pass_pct"] or 50)
+            messagebox.showinfo("Success", "Exam scheduled.")
+            self.refresh_exams()
+        except ValueError as e:
+            messagebox.showerror("Invalid Data", str(e))
+
+    def delete_exam(self):
+        sel = self.exam_tree.selection()
+        if not sel:
+            return messagebox.showwarning("No Selection", "Select an exam in the table first.")
+        if not messagebox.askyesno("Confirm", "Delete the selected exam?\n(Stored results are kept.)"):
+            return
+        try:
+            self.controller.exams.delete(int(sel[0]))
+        except ValueError as e:
+            return messagebox.showwarning("Cannot Delete", str(e))
+        self.refresh_exams()
+
+    # ---------- taking the exam ----------
+    def _set_nav_state(self, on):
+        st = "normal" if on else "disabled"
+        for b in (self.prev_btn, self.next_btn, self.submit_btn, self.flag_btn):
+            b.config(state=st)
+
+    def _instructions(self, exam):
+        neg = float(exam.get("negative_marking") or 0)
+        neg_text = "none" if neg == 0 else f"{neg} of the question's marks is deducted for each wrong MCQ / True-False answer"
+        return (f"{exam['title']}\nSubject: {exam['subject']}\n\n"
+                f"•  Questions: up to {exam['num_questions']}\n"
+                f"•  Duration: {exam['duration_min']} minutes\n"
+                f"•  Pass mark: {exam.get('pass_percent', 50)}%\n"
+                f"•  Negative marking: {neg_text}\n\n"
+                f"RULES\n"
+                f"•  The timer starts when you click Yes and cannot be paused.\n"
+                f"•  The exam is submitted automatically when time runs out.\n"
+                f"•  Leaving this window (Alt+Tab, other apps) gives a warning;\n"
+                f"   {MAX_PROCTOR_WARNINGS} warnings submit your exam automatically.\n"
+                f"•  Use the Question Navigator to jump between questions and\n"
+                f"   mark questions for review.\n\n"
+                f"Start the exam now?")
+
+    def start_exam(self):
+        sel = self.exam_tree.selection()
+        if not sel:
+            return messagebox.showwarning("No Selection", "Select an exam first.")
+        if self.session and not self.session.finished:
+            return
+        exam = next(e for e in self.controller.exams.list_exams() if e["id"] == int(sel[0]))
+        username = self.controller.auth.current_user["username"]
+        status = self.controller.exams.status(exam, username)
+        if status != "Live":
+            reasons = {"Upcoming": f"This exam opens at {exam['start_time']}.",
+                       "Closed": f"This exam closed at {exam.get('end_time')}.",
+                       "Completed": "You have already submitted this exam."}
+            return messagebox.showwarning("Cannot Start", reasons.get(status, "This exam is not available."))
+        if not messagebox.askyesno("Exam Instructions", self._instructions(exam)):
+            return
+        try:
+            self.session = self.controller.exams.start(exam, username)
+        except ValueError as e:
+            return messagebox.showwarning("Cannot Start", str(e))
+        self.exam_title.config(text=exam["title"])
+        self.warn_label.config(text="")
+        self._set_nav_state(True)
+        self.show_question()
+        self._tick()
+
+    def _save_current_answer(self):
+        if not self.session:
+            return
+        q = self.session.current()
+        if q["qtype"] == "Descriptive":
+            self.session.answers[q["id"]] = self.desc_box.get("1.0", "end").strip()
+        else:
+            self.session.answers[q["id"]] = self.answer_var.get()
+
+    def _on_answer(self):
+        if self.session and not self.session.finished:
+            self._save_current_answer()
+            self._refresh_progress()
+            self._build_palette()
+
+    def _refresh_progress(self):
+        s = self.session
+        q = s.current()
+        done = s.answered_count()
+        self.progress_label.config(text=f"Question {s.index + 1} of {len(s.questions)}  ·  {q['marks']} mark(s)  ·  "
+                                        f"{q['qtype']}  ·  {q['difficulty']}   |   Answered {done}/{len(s.questions)}")
+        self.progress["value"] = done / len(s.questions) * 100
+
+    def _build_palette(self):
+        for w in self.pal_grid.winfo_children():
+            w.destroy()
+        s = self.session
+        for i in range(len(s.questions)):
+            if i == s.index:
+                bg, fg = NAVY, "white"
+            elif i in s.flagged:
+                bg, fg = C_ORANGE, "white"
+            elif s.is_answered(i):
+                bg, fg = C_GREEN, "white"
+            else:
+                bg, fg = "#ced4da", "#212529"
+            HoverButton(self.pal_grid, str(i + 1), bg, fg=fg, width=3, padx=2, pady=2,
+                        font=("Segoe UI", 9, "bold"),
+                        command=lambda i=i: self.goto(i)).grid(row=i // 5, column=i % 5, padx=2, pady=2)
+
+    def show_question(self):
+        s = self.session
+        q = s.current()
+        self._refresh_progress()
+        self.flag_var.set(s.index in s.flagged)
+        self.q_label.config(text=q["text"])
+        for w in self.options_frame.winfo_children():
+            w.destroy()
+        self.desc_box.pack_forget()
+        saved = s.answers.get(q["id"], "")
+        if q["qtype"] == "Descriptive":
+            self.desc_box.delete("1.0", "end")
+            self.desc_box.insert("1.0", saved)
+            self.desc_box.pack(padx=4, pady=6, anchor="w", fill="x")
+        else:
+            self.answer_var.set(saved)
+            choices = ([("A", q["option_a"]), ("B", q["option_b"]), ("C", q["option_c"]), ("D", q["option_d"])]
+                       if q["qtype"] == "MCQ" else [("True", "True"), ("False", "False")])
+            palette = [C_BLUE, C_ORANGE, C_GREEN, C_PURPLE]
+            for i, (value, label) in enumerate(choices):
+                if label:
+                    text = f"{value}.  {label}" if q["qtype"] == "MCQ" else label
+                    tk.Radiobutton(self.options_frame, text=text, value=value, variable=self.answer_var,
+                                   bg="white", fg=palette[i % 4], activeforeground=palette[i % 4],
+                                   selectcolor="#fff3bf", font=("Segoe UI", 12, "bold"), anchor="w",
+                                   cursor="hand2", command=self._on_answer).pack(anchor="w", pady=4)
+        self._build_palette()
+
+    def goto(self, index):
+        self._save_current_answer()
+        self.session.index = index
+        self.show_question()
+
+    def next_q(self):
+        if self.session.index < len(self.session.questions) - 1:
+            self.goto(self.session.index + 1)
+        else:
+            self.goto(self.session.index)
+
+    def prev_q(self):
+        if self.session.index > 0:
+            self.goto(self.session.index - 1)
+        else:
+            self.goto(self.session.index)
+
+    def toggle_flag(self):
+        s = self.session
+        if not s:
+            return
+        if self.flag_var.get():
+            s.flagged.add(s.index)
+        else:
+            s.flagged.discard(s.index)
+        self._build_palette()
+
+    def _tick(self):
+        s = self.session
+        if not s or s.finished:
+            return
+        rem = s.remaining_seconds()
+        self.timer_label.config(text=f"⏱ {fmt_secs(rem)}", fg="#ff6b6b" if rem <= 60 else C_YELLOW)
+        if rem <= 0:
+            with self.controller.proctor_paused():
+                messagebox.showinfo("Time Up", "Time has expired. Your exam is being submitted automatically.")
+            self.finish(auto=True)
+            return
+        self.timer_job = self.after(1000, self._tick)
+
+    def proctor_violation(self):
+        """Called by the app when the exam window lost focus."""
+        s = self.session
+        if not s or s.finished:
+            return
+        s.warnings += 1
+        self.warn_label.config(text=f"⚠ Warnings: {s.warnings}/{MAX_PROCTOR_WARNINGS}")
+        self.controller.audit.log("PROCTOR_WARNING", f"left the exam window ({s.warnings}/{MAX_PROCTOR_WARNINGS})",
+                                  actor=s.username)
+        with self.controller.proctor_paused():
+            if s.warnings >= MAX_PROCTOR_WARNINGS:
+                messagebox.showerror("Exam Terminated",
+                                     "You left the exam window too many times.\nYour exam is being submitted now.")
+            else:
+                messagebox.showwarning("Warning", f"You left the exam window.\n\nWarning {s.warnings} of "
+                                                  f"{MAX_PROCTOR_WARNINGS}. At {MAX_PROCTOR_WARNINGS} warnings your exam "
+                                                  f"is submitted automatically.")
+        if s.warnings >= MAX_PROCTOR_WARNINGS:
+            self.finish(auto=True)
+
+    def submit_clicked(self):
+        self._save_current_answer()
+        s = self.session
+        unanswered = len(s.questions) - s.answered_count()
+        msg = f"Submit your exam now?\n\nAnswered: {s.answered_count()} of {len(s.questions)}"
+        if unanswered:
+            msg += f"\n⚠ {unanswered} question(s) are unanswered."
+        if s.flagged:
+            msg += f"\n🚩 {len(s.flagged)} question(s) are marked for review."
+        with self.controller.proctor_paused():
+            ok = messagebox.askyesno("Confirm Submission", msg)
+        if ok:
+            self.finish(auto=False)
+
+    def finish(self, auto):
+        s = self.session
+        if s.finished:
+            return
+        self._save_current_answer()
+        s.finished = True
+        if self.timer_job:
+            self.after_cancel(self.timer_job)
+            self.timer_job = None
+        result = self.controller.results.evaluate_and_store(s, auto_submitted=auto)
+        self.controller.exams.end(s.username)
+        self._set_nav_state(False)
+        self.timer_label.config(text="")
+        self.exam_title.config(text="No exam in progress")
+        self.progress_label.config(text="")
+        self.warn_label.config(text="")
+        self.progress["value"] = 0
+        self.q_label.config(text="Exam submitted. Opening your result...")
+        for w in self.options_frame.winfo_children():
+            w.destroy()
+        for w in self.pal_grid.winfo_children():
+            w.destroy()
+        self.desc_box.pack_forget()
+        self.session = None
+        self.controller.frames[ResultPage].focus_result = result["id"]
+        self.controller.show_frame(ResultPage)
+
+
+# ------------------------------------------------------------------
+# RESULT SCREEN
+# ------------------------------------------------------------------
+class ResultPage(ModulePageBase):
+    def __init__(self, parent, controller):
+        super().__init__(parent, controller, "📊  Automatic Result Generation", C_GREEN)
+        self.focus_result = None
+        self.rows = {}
+        self.current = None
+
+        body = tk.Frame(self, bg=PAGE_BG)
+        body.pack(fill="both", expand=True, padx=12, pady=12)
+
+        left = card(body, C_GREEN, width=400)
+        left.pack(side="left", fill="y", padx=(0, 12))
+        left.pack_propagate(False)
+        panel_title(left, "🧾  Scorecard", C_GREEN)
+        self.card_box = tk.Text(left, width=44, height=14, bg="#e6f7f4", fg="#12423b", relief="flat",
+                                font=("Consolas", 9), wrap="word")
+        self.card_box.pack(padx=14, pady=10, fill="x")
+        btns = tk.Frame(left, bg="white")
+        btns.pack(fill="x", padx=14)
+        btns.columnconfigure(0, weight=1)
+        btns.columnconfigure(1, weight=1)
+        HoverButton(btns, "🔍 Answer Review", C_ORANGE, pady=4, command=self.show_review).grid(
+            row=0, column=0, columnspan=2, sticky="we", pady=2)
+        HoverButton(btns, "💾 Download", C_GREEN, pady=4, command=self.download).grid(row=1, column=0, sticky="we", padx=(0, 2), pady=2)
+        HoverButton(btns, "🖨 Print", C_PURPLE, pady=4, command=self.print_card).grid(row=1, column=1, sticky="we", padx=(2, 0), pady=2)
+        HoverButton(btns, "📤 Export Listed Results (CSV)", C_BLUE, pady=4, command=self.export_all).grid(
+            row=2, column=0, columnspan=2, sticky="we", pady=2)
+
+        self.board_title = tk.Label(left, text="", bg=C_ORANGE, fg="white", anchor="w", padx=14, pady=7,
+                                    font=("Segoe UI", 11, "bold"))
+        self.board_title.pack(fill="x", pady=(10, 0))
+        self.board = tk.Listbox(left, height=6, font=("Consolas", 10), relief="flat", bg="#fff3e0", fg="#6b3a00",
+                                selectbackground=C_YELLOW)
+        self.board.pack(fill="x", padx=14, pady=10)
+
+        right = card(body, C_GREEN)
+        right.pack(side="left", fill="both", expand=True)
+        panel_title(right, "🗄  Stored Results", NAVY)
+        filt = tk.Frame(right, bg="white")
+        filt.pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(filt, text="Exam:", bg="white", font=("Segoe UI", 10, "bold")).pack(side="left")
+        self.exam_filter = tk.StringVar(value="All")
+        self.filter_combo = ttk.Combobox(filt, textvariable=self.exam_filter, state="readonly", width=28)
+        self.filter_combo.pack(side="left", padx=6)
+        self.filter_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        self.count_label = tk.Label(filt, text="", bg="white", fg=C_PURPLE, font=("Segoe UI", 10, "bold"))
+        self.count_label.pack(side="right")
+        cols = ("Student", "Exam", "Score", "Percent", "Grade", "Result", "Submitted")
+        self.tree = ttk.Treeview(right, columns=cols, show="headings")
+        for c in cols:
+            self.tree.heading(c, text=c)
+            self.tree.column(c, anchor="center", width=100)
+        self.tree.pack(fill="both", expand=True, padx=14, pady=14)
+        self.tree.tag_configure("good", background="#d8f3dc")
+        self.tree.tag_configure("mid", background="#fff3bf")
+        self.tree.tag_configure("bad", background="#ffd6d6")
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+
+    def _only_self(self):
+        auth = self.controller.auth
+        return auth.current_user["username"] if auth.has_role("student") else None
+
+    def on_show(self):
+        only_self = self._only_self()
+        titles = sorted({r["exam_title"] for r in self.controller.results.list_results(only_self)})
+        self.filter_combo["values"] = ["All"] + titles
+        if self.exam_filter.get() not in ["All"] + titles:
+            self.exam_filter.set("All")
+        self.refresh()
+        self.board_title.config(text="🏆  My Best Scores" if only_self else "🏆  Top Scores (heap)")
+        self.board.delete(0, "end")
+        for i, r in enumerate(self.controller.results.leaderboard(username=only_self), 1):
+            medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+            self.board.insert("end", f" {medal} {r['username']:<10} {r['percentage']:>6}%  {r['grade']}")
+
+        target = str(self.focus_result) if self.focus_result else None
+        self.focus_result = None
+        if target in self.rows:
+            self.tree.selection_set(target)
+            self.show_card(self.rows[target])
+
+    def refresh(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        self.rows = {}
+        wanted = self.exam_filter.get()
+        for r in self.controller.results.list_results(self._only_self()):
+            if wanted != "All" and r["exam_title"] != wanted:
+                continue
+            iid = str(r["id"])
+            self.rows[iid] = r
+            tag = "good" if r["percentage"] >= 80 else "mid" if r["percentage"] >= 50 else "bad"
+            self.tree.insert("", "end", iid=iid, tags=(tag,), values=(
+                r["username"], r["exam_title"], f"{r['score']}/{r['total']}", f"{r['percentage']}%",
+                r["grade"], "PASS" if r.get("passed") else "FAIL", r["submitted_at"]))
+        self.count_label.config(text=f"{len(self.rows)} result(s)")
+        self.current = None
+        self._set_card("Select a result to view its scorecard.")
+
+    def _set_card(self, text):
+        self.card_box.config(state="normal")
+        self.card_box.delete("1.0", "end")
+        self.card_box.insert("1.0", text)
+        self.card_box.config(state="disabled")
+
+    def show_card(self, r):
+        self.current = r
+        self._set_card(self.controller.results.scorecard_text(r))
+
+    def on_select(self, _):
+        sel = self.tree.selection()
+        if sel and sel[0] in self.rows:
+            self.show_card(self.rows[sel[0]])
+
+    def _current_text(self):
+        r = self.current
+        if not r:
+            messagebox.showwarning("No Selection", "Select a result first.")
+            return None, None
+        return r, self.controller.results.scorecard_text(r)
+
+    def show_review(self):
+        r = self.current
+        if not r:
+            return messagebox.showwarning("No Selection", "Select a result first.")
+        rows = self.controller.results.details(r["id"])
+        if not rows:
+            return messagebox.showinfo("No Details", "No answer details were stored for this result.")
+        win = tk.Toplevel(self)
+        win.title(f"Answer Review - {r['username']} - {r['exam_title']}")
+        win.geometry("1040x560")
+        win.configure(bg=PAGE_BG)
+        win.transient(self)
+        tk.Label(win, text=f"🔍  Answer Review   ·   {r['exam_title']}   ·   {r['score']}/{r['total']}  ({r['percentage']}%)",
+                 bg=C_ORANGE, fg="white", anchor="w", padx=16, pady=10, font=("Segoe UI", 13, "bold")).pack(fill="x")
+        HoverButton(win, "Close", C_RED, command=win.destroy).pack(side="bottom", anchor="e", padx=16, pady=10)
+        holder = tk.Frame(win, bg=PAGE_BG)
+        holder.pack(fill="both", expand=True, padx=16, pady=12)
+        cols = ("#", "Question", "Your Answer", "Correct Answer", "Marks", "Result")
+        tree = ttk.Treeview(holder, columns=cols, show="headings")
+        for c, w in zip(cols, (40, 380, 170, 170, 70, 90)):
+            tree.heading(c, text=c)
+            tree.column(c, width=w, anchor="w" if c in ("Question", "Your Answer", "Correct Answer") else "center")
+        sb = ttk.Scrollbar(holder, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        for tag, col in (("Correct", "#d8f3dc"), ("Partial", "#fff3bf"), ("Wrong", "#ffd6d6"), ("Unanswered", "#e9ecef")):
+            tree.tag_configure(tag, background=col)
+        for i, a in enumerate(rows, 1):
+            tree.insert("", "end", tags=(a["status"],), values=(
+                i, a["question_text"], a["given"], a["correct"], f"{a['awarded']}/{a['max_marks']}", a["status"]))
+
+    def download(self):
+        r, text = self._current_text()
+        if not r:
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".txt", initialfile=f"scorecard_{r['username']}_{r['id']}.txt",
+                                            filetypes=[("Text file", "*.txt")])
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            messagebox.showinfo("Saved", f"Scorecard saved to:\n{path}")
+
+    def export_all(self):
+        if not self.rows:
+            return messagebox.showinfo("No Data", "There are no results to export.")
+        path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile="exam_results.csv",
+                                            filetypes=[("CSV file", "*.csv")])
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["Student", "Exam", "Score", "Total", "Percentage", "Grade", "Result", "Correct", "Wrong",
+                        "Unanswered", "Time taken", "Warnings", "Submission", "Submitted at"])
+            for r in sorted(self.rows.values(), key=lambda r: r["id"]):
+                w.writerow([r["username"], r["exam_title"], r["score"], r["total"], r["percentage"], r["grade"],
+                            "PASS" if r.get("passed") else "FAIL", r.get("correct_count", 0), r.get("wrong_count", 0),
+                            r.get("unanswered", 0), fmt_secs(r.get("time_taken_sec", 0)), r.get("warnings", 0),
+                            "Auto" if r["auto_submitted"] else "Manual", r["submitted_at"]])
+        messagebox.showinfo("Exported", f"{len(self.rows)} result(s) saved to:\n{path}")
+
+    def print_card(self):
+        r, text = self._current_text()
+        if not r:
+            return
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "print_scorecard.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        try:
+            if os.name == "nt":
+                os.startfile(path, "print")
+            else:
+                os.system(f'lp "{path}" 2>/dev/null')
+            messagebox.showinfo("Print", "Scorecard sent to the default printer.")
+        except Exception as e:
+            messagebox.showerror("Print Failed", str(e))
+
+
+# ------------------------------------------------------------------
+# ANALYTICS SCREEN (admin / teacher)
+# ------------------------------------------------------------------
+class AnalyticsPage(ModulePageBase):
+    def __init__(self, parent, controller):
+        super().__init__(parent, controller, "📈  Reports & Analytics", C_ORANGE)
+        self.audit_shown = True
+
+        body = tk.Frame(self, bg=PAGE_BG)
+        body.pack(fill="both", expand=True, padx=12, pady=12)
+        self.nb = ttk.Notebook(body)
+        self.nb.pack(fill="both", expand=True)
+
+        # ---- tab 1: overview ----
+        self.overview = tk.Frame(self.nb, bg="white")
+        self.nb.add(self.overview, text="📊 Overview")
+        self.kpi_row = tk.Frame(self.overview, bg="white")
+        self.kpi_row.pack(fill="x", padx=14, pady=14)
+        charts = tk.Frame(self.overview, bg="white")
+        charts.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        self.avg_data, self.grade_data = [], []
+        left = tk.Frame(charts, bg="white", highlightbackground=C_BLUE, highlightthickness=2)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 7))
+        panel_title(left, "Average score per exam (%)", C_BLUE)
+        self.avg_canvas = tk.Canvas(left, bg="white", highlightthickness=0)
+        self.avg_canvas.pack(fill="both", expand=True)
+        self.avg_canvas.bind("<Configure>", lambda e: draw_bar_chart(self.avg_canvas, self.avg_data, 100, suffix="%"))
+        right = tk.Frame(charts, bg="white", highlightbackground=C_GREEN, highlightthickness=2)
+        right.pack(side="left", fill="both", expand=True, padx=(7, 0))
+        panel_title(right, "Grade distribution (students)", C_GREEN)
+        self.grade_canvas = tk.Canvas(right, bg="white", highlightthickness=0)
+        self.grade_canvas.pack(fill="both", expand=True)
+        self.grade_canvas.bind("<Configure>", lambda e: draw_bar_chart(self.grade_canvas, self.grade_data, integer=True))
+
+        # ---- tab 2: hardest questions ----
+        self.hard_tab = tk.Frame(self.nb, bg="white")
+        self.nb.add(self.hard_tab, text="❓ Hardest Questions")
+        tk.Label(self.hard_tab, text="Questions with the lowest average score across all attempts. "
+                                     "Use this to find unclear or very difficult questions.",
+                 bg="white", fg="#495057", font=("Segoe UI", 10)).pack(anchor="w", padx=14, pady=(12, 4))
+        self.hard_tree = self._make_tree(self.hard_tab, ("Question", "Attempts", "Avg score %"), (620, 90, 110), C_ORANGE)
+
+        # ---- tab 3: audit log (admin) ----
+        self.audit_tab = tk.Frame(self.nb, bg="white")
+        self.nb.add(self.audit_tab, text="🧾 Audit Log")
+        bar = tk.Frame(self.audit_tab, bg="white")
+        bar.pack(fill="x", padx=14, pady=(12, 0))
+        tk.Label(bar, text="Latest 300 events: logins, exams, user and question changes.", bg="white", fg="#495057",
+                 font=("Segoe UI", 10)).pack(side="left")
+        HoverButton(bar, "⟳ Refresh", C_BLUE, pady=2, command=self.load_audit).pack(side="right")
+        self.audit_tree = self._make_tree(self.audit_tab, ("Time", "User", "Action", "Details"), (150, 110, 160, 460), C_BLUE)
+
+    @staticmethod
+    def _make_tree(parent, cols, widths, accent):
+        holder = tk.Frame(parent, bg="white")
+        holder.pack(fill="both", expand=True, padx=14, pady=12)
+        tree = ttk.Treeview(holder, columns=cols, show="headings")
+        for c, w in zip(cols, widths):
+            tree.heading(c, text=c)
+            tree.column(c, width=w, anchor="w" if c in ("Question", "Details") else "center")
+        sb = ttk.Scrollbar(holder, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        style_tree(tree, accent)
+        return tree
+
+    def on_show(self):
+        if not self.controller.require_role("admin", "teacher"):
+            self.after(10, self.go_back)
+            return
+        is_admin = self.controller.auth.has_role("admin")
+        if is_admin and not self.audit_shown:
+            self.nb.add(self.audit_tab, text="🧾 Audit Log")
+            self.audit_shown = True
+        elif not is_admin and self.audit_shown:
+            self.nb.forget(self.audit_tab)
+            self.audit_shown = False
+        rg = self.controller.results
+        stats = rg.overall_stats()
+        for w in self.kpi_row.winfo_children():
+            w.destroy()
+        for (label, value), col in zip((("Attempts", stats["attempts"]), ("Average score", f"{stats['average']}%"),
+                                        ("Pass rate", f"{stats['pass_rate']}%"), ("Highest score", f"{stats['highest']}%")),
+                                       TILE_COLORS):
+            box = tk.Frame(self.kpi_row, bg=col, width=210, height=78)
+            box.pack(side="left", padx=(0, 14))
+            box.pack_propagate(False)
+            tk.Label(box, text=str(value), bg=col, fg="white", font=("Segoe UI", 22, "bold")).pack(pady=(8, 0))
+            tk.Label(box, text=label, bg=col, fg="white", font=("Segoe UI", 10)).pack()
+        self.avg_data = [(t, a) for t, a, _ in rg.exam_averages()]
+        self.grade_data = rg.grade_distribution()
+        draw_bar_chart(self.avg_canvas, self.avg_data, 100, suffix="%")
+        draw_bar_chart(self.grade_canvas, self.grade_data, integer=True)
+
+        for row in self.hard_tree.get_children():
+            self.hard_tree.delete(row)
+        for text, attempts, pct in rg.hardest_questions():
+            self.hard_tree.insert("", "end", values=(text, attempts, pct))
+        zebra(self.hard_tree)
+        if is_admin:
+            self.load_audit()
+
+    def load_audit(self):
+        for row in self.audit_tree.get_children():
+            self.audit_tree.delete(row)
+        for r in self.controller.audit.recent():
+            self.audit_tree.insert("", "end", values=r)
+        zebra(self.audit_tree)
+
+
+def main():
+    app = ExamApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
 
